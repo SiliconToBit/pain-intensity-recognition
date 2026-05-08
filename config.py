@@ -3,7 +3,7 @@ import os
 
 class Config:
     def __init__(self, config_path=None):
-        self.mintpain_root = "/home/gm/dataset/mintpain"
+        self.mintpain_root = "/home/featurize/work/dataset/mintpain"
         self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
         self.loso_splits_path = os.path.join(self.mintpain_root, "loso_splits.pkl")
         self.samples_pkl_path = os.path.join(self.mintpain_root, "mintpain_edlm_samples.pkl")

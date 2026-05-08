@@ -24,6 +24,27 @@ def parse_frame_timestamp(filename):
     return 0
 
 
+def remap_frame_paths(obj, config):
+    """
+    Recursively remap hardcoded /home/gm paths to the correct config path.
+    Handles nested dicts and lists containing frame paths.
+    """
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == "frame_paths" and isinstance(value, list):
+                obj[key] = [
+                    path.replace("/home/gm/dataset/mintpain", config.preprocessed_dir.replace("/rgb_preprocessed", ""))
+                    if isinstance(path, str) else path
+                    for path in value
+                ]
+            elif isinstance(value, (dict, list)):
+                remap_frame_paths(value, config)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, (dict, list)):
+                remap_frame_paths(item, config)
+
+
 def normalize_subject_name(name):
     m = re.match(r"Sub(\d+)", name)
     if m:
@@ -35,6 +56,8 @@ def normalize_subject_name(name):
 def load_loso_splits(config):
     with open(config.loso_splits_path, "rb") as f:
         loso_splits = pickle.load(f)
+    # Remap hardcoded /home/gm paths to current config paths
+    remap_frame_paths(loso_splits, config)
     return loso_splits
 
 
@@ -152,7 +175,8 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         print(f"  Undersampled to {len(train_frame_paths)} frames (balanced across {config.num_classes} classes)")
 
     dataset = FrameDataset(train_frame_paths, train_labels, transform=transform)
-    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=4)
+    # 降低 num_workers 以避免多进程问题，使用 pin_memory 加速数据传输
+    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     model = FeatureExtractor(
         num_classes=config.num_classes,
@@ -167,37 +191,45 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
     patience = 5
     patience_counter = 0
 
+    print(f"  Starting fine-tuning for fold {fold_idx}...")
     for epoch in range(config.feature_extractor_epochs):
         model.train()
         total_loss = 0
         correct = 0
         total = 0
-        for imgs, lbls in loader:
-            imgs = imgs.to(device)
-            lbls = lbls.to(device)
-            optimizer.zero_grad()
-            outputs = model(imgs)
-            loss = criterion(outputs, lbls)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += lbls.size(0)
-            correct += predicted.eq(lbls).sum().item()
+        batch_count = 0
+        with tqdm(loader, desc=f"Fold {fold_idx} Epoch {epoch+1}/{config.feature_extractor_epochs}", leave=False) as pbar:
+            for imgs, lbls in pbar:
+                imgs = imgs.to(device)
+                lbls = lbls.to(device)
+                optimizer.zero_grad()
+                outputs = model(imgs)
+                loss = criterion(outputs, lbls)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += lbls.size(0)
+                correct += predicted.eq(lbls).sum().item()
+                batch_count += 1
+                # 更新进度条显示
+                avg_loss = total_loss / batch_count
+                acc = 100. * correct / total if total > 0 else 0
+                pbar.set_postfix({"loss": f"{avg_loss:.4f}", "acc": f"{acc:.2f}%"})
         scheduler.step()
         avg_loss = total_loss / len(loader)
-        if (epoch + 1) % 10 == 0:
-            acc = 100. * correct / total
-            print(f"Fold {fold_idx} | Epoch {epoch+1}/{config.feature_extractor_epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
+        acc = 100. * correct / total if total > 0 else 0
+        print(f"✓ Fold {fold_idx} | Epoch {epoch+1}/{config.feature_extractor_epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
             save_path = os.path.join(config.weights_dir, f"feature_extractor_fold{fold_idx:02d}.pth")
             torch.save(model.state_dict(), save_path)
+            print(f"  💾 Best model saved (loss: {best_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"  Early stopping at epoch {epoch+1}")
+                print(f"  ⏹️  Early stopping at epoch {epoch+1}")
                 break
 
     print(f"Saved best feature extractor for fold {fold_idx}")
