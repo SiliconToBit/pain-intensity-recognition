@@ -101,7 +101,7 @@ class FeatureExtractor(nn.Module):
 
 
 class StreamDNN1(nn.Module):
-    def __init__(self, input_dim=3, hidden=128):
+    def __init__(self, input_dim=3, hidden=256):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(input_dim, 256, kernel_size=3, padding=1),
@@ -110,14 +110,16 @@ class StreamDNN1(nn.Module):
             nn.ReLU()
         )
         self.bilstm = nn.LSTM(256, hidden, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(hidden * 2, 128)
+        self.fc = nn.Linear(hidden * 2, 4096)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         x = self.conv(x)
         x = x.permute(0, 2, 1)
         out, _ = self.bilstm(x)
-        return self.fc(out[:, -1, :])
+        out = self.fc(out[:, -1, :])
+        return self.dropout(out)
 
 
 class StreamDNN2(nn.Module):
@@ -130,29 +132,33 @@ class StreamDNN2(nn.Module):
             nn.ReLU()
         )
         self.bilstm = nn.LSTM(128, hidden, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(hidden * 2, 128)
+        self.fc = nn.Linear(hidden * 2, 4096)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         x = self.conv(x)
         x = x.permute(0, 2, 1)
         out, _ = self.bilstm(x)
-        return self.fc(out[:, -1, :])
+        out = self.fc(out[:, -1, :])
+        return self.dropout(out)
 
 
 class StreamDNN3(nn.Module):
     def __init__(self, input_dim=3, hidden=128):
         super().__init__()
         self.conv = nn.Conv1d(input_dim, 256, kernel_size=3, padding=1)
-        self.lstm = nn.LSTM(256, hidden, batch_first=True)
-        self.fc = nn.Linear(hidden, 128)
+        self.bilstm = nn.LSTM(256, hidden, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(hidden * 2, 4096)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         x = torch.relu(self.conv(x))
         x = x.permute(0, 2, 1)
-        out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :])
+        out, _ = self.bilstm(x)
+        out = self.fc(out[:, -1, :])
+        return self.dropout(out)
 
 
 class EnsembleEDLM(nn.Module):
@@ -161,7 +167,7 @@ class EnsembleEDLM(nn.Module):
         self.dnn1 = StreamDNN1()
         self.dnn2 = StreamDNN2()
         self.dnn3 = StreamDNN3()
-        self.fc1 = nn.Linear(128 * 3, 256)
+        self.fc1 = nn.Linear(4096 * 3, 256)
         self.fc2 = nn.Linear(256, num_classes)
 
     def forward(self, x):
