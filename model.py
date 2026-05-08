@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
+try:
+    from facenet_pytorch import InceptionResnetV1
+except ImportError:
+    InceptionResnetV1 = None
+
 
 def load_vggface2_weights(model, weights_path):
     if not os.path.exists(weights_path):
@@ -38,30 +43,57 @@ def load_vggface2_weights(model, weights_path):
 
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, num_classes=5, bottleneck_dim=4, vggface_weights_path=None):
+    def __init__(self, num_classes=5, bottleneck_dim=4, vggface_weights_path=None, backbone="vgg16_bn"):
         super().__init__()
-        vgg = models.vgg16_bn(weights='IMAGENET1K_V1')
-        self.features = vgg.features
-        for param in self.features.parameters():
-            param.requires_grad = False
-        self.avgpool = vgg.avgpool
+        self.backbone_name = backbone
 
-        if vggface_weights_path:
-            load_vggface2_weights(self, vggface_weights_path)
+        if backbone == "inceptionresnet_vggface2":
+            if InceptionResnetV1 is None:
+                raise ImportError(
+                    "facenet-pytorch is required for VGGFace2 backbone. "
+                    "Install with: pip install facenet-pytorch"
+                )
+            print("Using InceptionResnetV1 backbone pretrained on VGGFace2.")
+            self.backbone = InceptionResnetV1(pretrained="vggface2", classify=False)
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            # Fine-tune the top of the network instead of freezing everything.
+            for name, param in self.backbone.named_parameters():
+                if name.startswith(("repeat_3", "block8", "last_linear", "last_bn")):
+                    param.requires_grad = True
+            self.bottleneck = nn.Sequential(
+                nn.Linear(512, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(),
+                nn.Linear(256, bottleneck_dim),
+            )
+        else:
+            vgg = models.vgg16_bn(weights='IMAGENET1K_V1')
+            self.features = vgg.features
+            for param in self.features.parameters():
+                param.requires_grad = False
+            self.avgpool = vgg.avgpool
 
-        self.bottleneck = nn.Sequential(
-            nn.Linear(25088, 4096),
-            nn.ReLU(inplace=True),
-            nn.Dropout(),
-            nn.Linear(4096, bottleneck_dim),
-        )
+            if vggface_weights_path:
+                load_vggface2_weights(self, vggface_weights_path)
+
+            self.bottleneck = nn.Sequential(
+                nn.Linear(25088, 4096),
+                nn.ReLU(inplace=True),
+                nn.Dropout(),
+                nn.Linear(4096, bottleneck_dim),
+            )
         self.classifier = nn.Linear(bottleneck_dim, num_classes)
 
     def forward(self, x, return_features=False):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        features = self.bottleneck(x)
+        if self.backbone_name == "inceptionresnet_vggface2":
+            x = self.backbone(x)
+            features = self.bottleneck(x)
+        else:
+            x = self.features(x)
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            features = self.bottleneck(x)
         out = self.classifier(features)
         if return_features:
             return features

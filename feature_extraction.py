@@ -118,7 +118,22 @@ class FrameDataset(Dataset):
         return img, label
 
 
-def get_transform(train=True):
+def get_transform(train=True, backbone="vgg16_bn"):
+    if backbone == "inceptionresnet_vggface2":
+        if train:
+            return transforms.Compose([
+                transforms.Resize((160, 160)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        return transforms.Compose([
+            transforms.Resize((160, 160)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+
     if train:
         return transforms.Compose([
             transforms.Resize((224, 224)),
@@ -166,7 +181,7 @@ def undersample_to_balance(frame_paths, frame_labels, num_classes=5):
 
 def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    transform = get_transform(train=True)
+    transform = get_transform(train=True, backbone=config.feature_backbone)
 
     if config.undersample:
         train_frame_paths, train_labels = undersample_to_balance(
@@ -182,9 +197,17 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         num_classes=config.num_classes,
         bottleneck_dim=config.bottleneck_dim,
         vggface_weights_path=config.vggface_weights_path,
+        backbone=config.feature_backbone,
     ).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.feature_extractor_lr)
+    backbone_params = [p for name, p in model.named_parameters() if name.startswith("backbone.") and p.requires_grad]
+    head_params = [p for name, p in model.named_parameters() if not name.startswith("backbone.") and p.requires_grad]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": backbone_params, "lr": config.feature_extractor_backbone_lr},
+            {"params": head_params, "lr": config.feature_extractor_lr},
+        ]
+    )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
     best_loss = float("inf")
@@ -239,7 +262,7 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
 
 def extract_4d_features(config, model, frame_paths, batch_size=48):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    transform = get_transform(train=False)
+    transform = get_transform(train=False, backbone=config.feature_backbone)
     model.eval()
 
     dataset = FrameDataset(frame_paths, transform=transform)
@@ -256,7 +279,13 @@ def extract_4d_features(config, model, frame_paths, batch_size=48):
 
 def extract_features(config):
     loso_splits = load_loso_splits(config)
-    fold_names = sorted(loso_splits.keys())
+    all_fold_names = sorted(loso_splits.keys())
+    if config.num_folds is not None and config.num_folds > 0:
+        fold_names = all_fold_names[:min(config.num_folds, len(all_fold_names))]
+    else:
+        fold_names = all_fold_names
+
+    print(f"Using {len(fold_names)} folds for feature extraction (configured num_folds={config.num_folds}).")
 
     for fold_idx, fold_name in enumerate(fold_names):
         print(f"\n{'='*50}")

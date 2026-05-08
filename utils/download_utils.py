@@ -31,6 +31,11 @@ def download_file(url, destination, chunk_size=8192):
 
 
 def download_pretrained_weights(config):
+    if getattr(config, "feature_backbone", "vgg16_bn") == "inceptionresnet_vggface2":
+        print("Using facenet-pytorch InceptionResnetV1 pretrained on VGGFace2.")
+        print("Weights will be downloaded/cached automatically on first run.")
+        return
+
     if os.path.exists(config.vggface_weights_path):
         print(f"VGGFace2 weights found at: {config.vggface_weights_path}")
         return

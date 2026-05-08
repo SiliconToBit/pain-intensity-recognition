@@ -81,13 +81,19 @@ def train_and_evaluate(config):
     with open(config.loso_splits_path, "rb") as f:
         loso_splits = pickle.load(f)
 
-    fold_names = sorted(loso_splits.keys())
+    all_fold_names = sorted(loso_splits.keys())
+    if config.num_folds is not None and config.num_folds > 0:
+        fold_names = all_fold_names[:min(config.num_folds, len(all_fold_names))]
+    else:
+        fold_names = all_fold_names
     num_folds = len(fold_names)
+    print(f"Using {num_folds} folds for training/evaluation (configured num_folds={config.num_folds}).")
 
     all_fold_accs = []
     all_fold_f1s = []
     all_fold_aucs = []
     all_per_class_aucs = []
+    processed_fold_names = []
     all_preds, all_labels = [], []
     all_cm = np.zeros((config.num_classes, config.num_classes), dtype=int)
 
@@ -167,6 +173,7 @@ def train_and_evaluate(config):
         all_fold_f1s.append(fold_f1)
         all_fold_aucs.append(test_auc)
         all_per_class_aucs.append(per_class_auc)
+        processed_fold_names.append(fold_name)
         all_preds.extend(test_preds)
         all_labels.extend(test_labels)
         all_cm += cm
@@ -203,7 +210,7 @@ def train_and_evaluate(config):
 
     import json
     fold_results = {}
-    for fold_name, acc, f1, auc, pcauc in zip(fold_names, all_fold_accs, all_fold_f1s, all_fold_aucs, all_per_class_aucs):
+    for fold_name, acc, f1, auc, pcauc in zip(processed_fold_names, all_fold_accs, all_fold_f1s, all_fold_aucs, all_per_class_aucs):
         fold_results[fold_name] = {
             "accuracy": acc, "f1": f1, "auc": auc,
             "per_class_auc": {str(i): float(a) for i, a in enumerate(pcauc)}
