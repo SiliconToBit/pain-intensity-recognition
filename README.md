@@ -1,49 +1,110 @@
-# EDLM MIntPAIN Reproduce
+# EDLM MIntPAIN — 疼痛强度识别
 
-本项目用于复现 EDLM (Ensemble Deep Learning Model) 在 MIntPAIN 数据集上的疼痛等级分类实验。
+本项目复现 EDLM (Ensemble Deep Learning Model) 在 MIntPAIN 数据集上的 5 级疼痛强度分类。
 
-## 算法流程
+---
 
-1. **早期融合**: 微调 VGGFace2 (VGG-16 架构) 作为特征提取器，输出 4 维特征向量
-2. **PCA 降维**: 将 4 维特征降至 3 维（训练集拟合，测试集变换，无泄露）
-3. **时序建模**: 滑动窗口 5 帧，步长 5 帧，生成 (5, 3) 序列
-4. **欠采样**: 训练阶段对各类别欠采样至平衡，缓解无痛帧过多问题
-5. **三流集成网络**: DNN1 (Conv1D+BiLSTM)、DNN2 (Conv1D+BiLSTM)、DNN3 (Conv1D+LSTM) 合并输出
-6. **LOSO 交叉验证**: 20 折留一受试者验证，输出 Accuracy、AUC、F1、混淆矩阵
+## 总体架构
+
+### 特征提取（FeatureExtractor）
+
+- **骨干网络**: InceptionResNetV1，预训练于 VGGFace2（人脸识别），部分顶层参与微调
+- **瓶颈层**: Linear(512→256) → ReLU → Dropout → Linear(256→4)，输出 4 维特征
+- **微调**: 每折独立微调 50 epoch，StepLR 每 20 epoch 衰减 0.5，patience=5 早停
+- **降维**: PCA 将 4 维降至 3 维（训练集拟合，测试集变换，无数据泄露）
+
+### 时序分类（EnsembleEDLM）
+
+- **输入**: 滑动窗口 5 帧，步长 5 帧，每帧 3 维 PCA 特征 → 序列形状 (5, 3)
+- **三流并行**:
+  - StreamDNN1: Conv1D(3→256) × 2 + BiLSTM(256→256) + FC(512→4096)
+  - StreamDNN2: Conv1D(3→128) × 2 + BiLSTM(128→128) + FC(256→4096)
+  - StreamDNN3: Conv1D(3→256) × 1 + BiLSTM(256→128) + FC(256→4096)
+- **融合**: 三流输出拼接 (4096×3) → FC(12288→256) → FC(256→5)
+- **训练**: 5 epoch，Adam lr=1e-4，StepLR step=2 gamma=0.5，patience=3 早停，梯度裁剪 max_norm=1.0
+
+### 验证
+
+- **LOSO 交叉验证**: 10 折留一受试者验证
+
+---
+
+## 实验结果
+
+### 总体指标 (10折 LOSO)
+
+| 指标 | 均值 | 标准差 |
+|------|------|--------|
+| Accuracy | 39.09% | ±10.38% |
+| F1 (weighted) | 30.07% | ±4.85% |
+| AUC (weighted) | 52.27% | ±4.70% |
+
+### 各类别 AUC
+
+| 类别 | 均值 AUC |
+|------|----------|
+| Class 0 (无痛) | 0.524 |
+| Class 1 | 0.518 |
+| Class 2 | 0.481 |
+| Class 3 | 0.542 |
+| Class 4 | 0.543 |
+
+### 混淆矩阵
+
+```
+          预测
+       0    1    2    3    4
+真实 0  1415  148  198  143  110
+     1   346   38   39   43   35
+     2   339   44   52   45   17
+     3   348   45   55   36   28
+     4   336   39   58   42   29
+```
+
+### 分类报告
+
+| 类别 | 精确率 | 召回率 | F1 | 支持数 |
+|------|--------|--------|-----|--------|
+| 0 | 0.51 | 0.70 | 0.59 | 2014 |
+| 1 | 0.12 | 0.08 | 0.09 | 501 |
+| 2 | 0.13 | 0.10 | 0.12 | 497 |
+| 3 | 0.12 | 0.07 | 0.09 | 512 |
+| 4 | 0.13 | 0.06 | 0.08 | 504 |
+
+---
+
+## 分析
+
+- **优于随机**: 39% 准确率对比随机基线 20%，模型学到了一定模式
+- **严重偏向无痛类**: Class 0 召回率 70%，但其余 4 类召回率均低于 10%，大量疼痛样本被误判为无痛
+- **类别不平衡**: 测试集无痛帧占 50%，模型倾向于多数类
+- **区分度不足**: AUC ~0.52 接近随机，疼痛等级间区分困难
+
+### 可能改进方向
+
+1. **增大 bottleneck_dim** (如 8→16) 和 **pca_dim** (如 3→6)，保留更多特征信息
+2. **加长时序窗口** (如 sequence_length=10→15)，捕捉更长程的疼痛变化
+3. **损失函数加权**，缓解类别不平衡
+4. **尝试不同骨干网络**，如 ResNet50 或专门的面部表情预训练模型
+
+---
 
 ## 项目结构
 
 ```
-edlm_mintpain_reproduce/
-├── README.md                  # 使用说明
+├── README.md                  # 使用说明 & 实验结果
 ├── requirements.txt           # 依赖清单
 ├── main.py                    # 一键运行主脚本
 ├── config.py                  # 所有可配置参数
-├── model.py                   # FeatureExtractor (VGGFace2) + 三流 EnsembleEDLM
-├── feature_extraction.py      # VGG微调、4D特征提取、PCA降维、5帧窗口生成
-├── train.py                   # LOSO交叉验证训练与评估（含梯度裁剪/早停）
+├── model.py                   # FeatureExtractor + EnsembleEDLM
+├── feature_extraction.py      # 微调、4D特征提取、PCA降维、窗口生成
+├── train.py                   # LOSO训练评估
+├── continue_training.py       # 续跑脚本（跳过已完成折）
 └── utils/
-    ├── dataset.py             # 时序数据集加载
-    ├── download_utils.py      # VGGFace2 权重下载指引
-    └── face_alignment.py      # 人脸检测与对齐（备用）
+    ├── dataset.py             # 时序数据集
+    ├── download_utils.py      # 权重下载指引
+    └── face_alignment.py      # 人脸检测与对齐
 ```
-
-## 数据集
-
-数据集位于 `/home/gm/dataset/mintpain`，包含已预处理的 224x224 人脸图像和 LOSO 划分文件。
-
-## VGGFace2 权重（强烈推荐）
-
-论文使用 VGGFace（在人脸数据集上预训练），而非 ImageNet。使用 VGGFace2 权重可显著提升表情特征敏感度：
-
-```bash
-# 下载转换后的 PyTorch VGGFace2 权重
-mkdir -p /home/gm/dataset/mintpain/weights
-# 推荐来源: https://github.com/ox-vgg/vgg_face2 或 https://github.com/cydonia999/VGGFace2-Pytorch
-# 将权重文件重命名为 vgg_face2.pth 并放置于 weights 目录
-```
-
-如未提供 VGGFace2 权重，代码将自动回退到 ImageNet 预训练权重。
 
 ## 环境配置
 
@@ -54,13 +115,13 @@ pip install -r requirements.txt
 ## 使用方法
 
 ```bash
-# 运行完整流程（特征提取 + 训练评估）
+# 完整流程
 python main.py
 
-# 仅运行训练（跳过特征提取）
+# 仅训练集成模型
 python main.py --skip_extraction
 
-# 仅运行特征提取
+# 仅特征提取
 python main.py --skip_train
 ```
 
@@ -68,21 +129,13 @@ python main.py --skip_train
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| mintpain_root | /home/gm/dataset/mintpain | 数据集根目录 |
-| num_classes | 5 | 疼痛等级分类数 |
-| sequence_length | 5 | 时序窗口长度（帧） |
-| bottleneck_dim | 4 | VGG 特征瓶颈维度 |
-| pca_dim | 3 | PCA 降维后维度 |
-| undersample | True | 训练时类别欠采样平衡 |
-| feature_extractor_epochs | 50 | 特征提取器微调 epoch 数 |
-| ensemble_epochs | 5 | 集成模型训练 epoch 数 |
-| batch_size | 48 | 批量大小 |
-| learning_rate | 1e-4 | 学习率 |
-| num_folds | 20 | LOSO 折数（=受试者数） |
-
-## 稳健性增强
-
-- **数据增强**: 微调时随机水平翻转、小角度仿射变换
-- **学习率调度**: StepLR (每 20 epoch 衰减 0.5)
-- **梯度裁剪**: RNN 训练时 max_norm=1.0
-- **早期停止**: 特征提取器 (patience=5) 和集成模型 (patience=3) 均监控验证损失
+| mintpain_root | /home/featurize/work/dataset/mintpain | 数据集根目录 |
+| num_classes | 5 | 疼痛等级 |
+| sequence_length | 5 | 时序窗口长度 |
+| bottleneck_dim | 4 | 特征瓶颈维度 |
+| pca_dim | 3 | PCA 降维维度 |
+| undersample | True | 训练欠采样平衡 |
+| feature_extractor_epochs | 50 | 微调 epoch 数 |
+| ensemble_epochs | 5 | 集成模型 epoch 数 |
+| num_folds | 10 | LOSO 折数 |
+| feature_backbone | inceptionresnet_vggface2 | 骨干网络 |
