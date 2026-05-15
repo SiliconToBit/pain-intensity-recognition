@@ -47,6 +47,8 @@ results/
 *.pkl
 *.log
 *.json
+*.tar.gz
+vgg_face_torch/
 
 # Jupyter
 .ipynb_checkpoints/

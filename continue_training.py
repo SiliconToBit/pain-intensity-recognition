@@ -74,8 +74,8 @@ def extract_features_skip_existing(config):
         train_sweep_frames = collect_sweep_frames_from_samples(train_samples)
         test_sweep_frames = collect_sweep_frames_from_samples(test_samples)
 
-        train_windows = generate_5frame_windows(train_sweep_frames, window_size=config.sequence_length, slide_step=5)
-        test_windows = generate_5frame_windows(test_sweep_frames, window_size=config.sequence_length, slide_step=5)
+        train_windows = generate_5frame_windows(train_sweep_frames, window_size=config.sequence_length, slide_step=1)
+        test_windows = generate_5frame_windows(test_sweep_frames, window_size=config.sequence_length, slide_step=1)
 
         print(f"Generated {len(train_windows)} train windows, {len(test_windows)} test windows (5-frame)")
 
@@ -86,9 +86,10 @@ def extract_features_skip_existing(config):
         all_frame_paths.sort()
 
         weight_size = os.path.getsize(weight_path) if os.path.exists(weight_path) else 0
-        is_inception_weight = 90e6 < weight_size < 130e6  # InceptionResnetV1 ~108MB, VGG16 ~449MB
+        # VGG16 weights are typically ~500MB+; skip fine-tuning if weights exist
+        is_vgg_weight = weight_size > 200e6
 
-        if os.path.exists(weight_path) and existing_files == 0 and is_inception_weight:
+        if os.path.exists(weight_path) and existing_files == 0 and is_vgg_weight:
             print(f"Loading existing weights from {weight_path} ({weight_size/1e6:.0f}MB, skipping fine-tuning)...")
             device = torch.device(config.device if torch.cuda.is_available() else "cpu")
             model = FeatureExtractor(

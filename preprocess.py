@@ -52,7 +52,10 @@ def preprocess_videos(config):
 
         frames = load_video_frames(video_path)
         if frames:
-            processed = process_video_frames(frames, align=True)
+            # align=False for strict paper reproduction (paper only mentions
+            # face detection, cropping, and centering — not alignment).
+            # Set align=True to enable face alignment for potential improvements.
+            processed = process_video_frames(frames, align=False)
             save_preprocessed_frames(processed, output_path)
 
     print(f"Preprocessing complete. Processed {len(video_files)} videos.")

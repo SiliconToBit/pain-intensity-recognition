@@ -77,8 +77,13 @@ def collect_sweep_frames_from_samples(samples):
     return sweep_frames
 
 
-def generate_5frame_windows(sweep_frames, window_size=5, slide_step=5):
-    windows = []
+def generate_5frame_windows(sweep_frames, window_size=5, slide_step=1):
+    """Generate overlapping 5-frame windows.
+
+    Per original paper analysis: overlapping windows (step=1) capture
+    fine-grained temporal changes and increase training data volume.
+    Step=5 (non-overlapping) reduces data by 5× and is NOT recommended.
+    """
     for (subject_id, sweep_id), info in sweep_frames.items():
         frames = info["frames"]
         label = info["label"]
@@ -118,22 +123,11 @@ class FrameDataset(Dataset):
         return img, label
 
 
-def get_transform(train=True, backbone="vgg16_bn"):
-    if backbone == "inceptionresnet_vggface2":
-        if train:
-            return transforms.Compose([
-                transforms.Resize((160, 160)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ])
-        return transforms.Compose([
-            transforms.Resize((160, 160)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+def get_transform(train=True, backbone="vgg16"):
+    """Image transform for VGG16 (224×224, ImageNet normalization).
 
+    Original VGGFace used the same input size as ImageNet-trained VGG16.
+    """
     if train:
         return transforms.Compose([
             transforms.Resize((224, 224)),
@@ -200,13 +194,11 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         backbone=config.feature_backbone,
     ).to(device)
     criterion = nn.CrossEntropyLoss()
-    backbone_params = [p for name, p in model.named_parameters() if name.startswith("backbone.") and p.requires_grad]
-    head_params = [p for name, p in model.named_parameters() if not name.startswith("backbone.") and p.requires_grad]
-    optimizer = torch.optim.Adam(
-        [
-            {"params": backbone_params, "lr": config.feature_extractor_backbone_lr},
-            {"params": head_params, "lr": config.feature_extractor_lr},
-        ]
+    # Only bottleneck + classifier are trainable; backbone is fully frozen
+    optimizer = torch.optim.SGD(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.feature_extractor_lr,
+        momentum=0.9,
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
@@ -303,8 +295,8 @@ def extract_features(config):
         train_sweep_frames = collect_sweep_frames_from_samples(train_samples)
         test_sweep_frames = collect_sweep_frames_from_samples(test_samples)
 
-        train_windows = generate_5frame_windows(train_sweep_frames, window_size=config.sequence_length, slide_step=5)
-        test_windows = generate_5frame_windows(test_sweep_frames, window_size=config.sequence_length, slide_step=5)
+        train_windows = generate_5frame_windows(train_sweep_frames, window_size=config.sequence_length, slide_step=1)
+        test_windows = generate_5frame_windows(test_sweep_frames, window_size=config.sequence_length, slide_step=1)
 
         print(f"Generated {len(train_windows)} train windows, {len(test_windows)} test windows (5-frame)")
 
@@ -327,6 +319,11 @@ def extract_features(config):
         pca = PCA(n_components=config.pca_dim)
         train_features_3d = pca.fit_transform(train_features_4d)
         test_features_3d = pca.transform(test_features_4d)
+
+        var_ratio = pca.explained_variance_ratio_.sum()
+        print(f"PCA {config.pca_dim}D retained variance: {var_ratio:.4f} ({var_ratio*100:.2f}%)")
+        if var_ratio < 0.99:
+            print(f"[WARNING] PCA retained variance {var_ratio:.4f} < 0.99 — check feature quality.")
 
         train_feat_map = {fp: feat for fp, feat in zip(train_frame_paths, train_features_3d)}
         test_feat_map = {fp: feat for fp, feat in zip(test_frame_paths, test_features_3d)}

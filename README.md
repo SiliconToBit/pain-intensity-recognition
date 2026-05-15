@@ -8,24 +8,24 @@
 
 ### 特征提取（FeatureExtractor）
 
-- **骨干网络**: InceptionResNetV1，预训练于 VGGFace2（人脸识别），部分顶层参与微调
-- **瓶颈层**: Linear(512→256) → ReLU → Dropout → Linear(256→4)，输出 4 维特征
-- **微调**: 每折独立微调 50 epoch，StepLR 每 20 epoch 衰减 0.5，patience=5 早停
-- **降维**: PCA 将 4 维降至 3 维（训练集拟合，测试集变换，无数据泄露）
+- **骨干网络**: 标准 VGG16，预训练于 VGGFace（Oxford 2015），**所有卷积层完全冻结**
+- **瓶颈层**: Linear(25088→4096) → ReLU → Dropout → Linear(4096→4)，输出 4 维特征
+- **微调**: 每折独立微调 50 epoch，SGD(lr=0.001, momentum=0.9)，StepLR 每 20 epoch 衰减 0.5，patience=5 早停
+- **降维**: PCA 将 4 维降至 3 维（训练集拟合，测试集变换，无数据泄露），验证方差保留 ≥ 99%
 
 ### 时序分类（EnsembleEDLM）
 
-- **输入**: 滑动窗口 5 帧，步长 5 帧，每帧 3 维 PCA 特征 → 序列形状 (5, 3)
+- **输入**: 滑动窗口 5 帧，步长 1 帧（重叠窗口），每帧 3 维 PCA 特征 → 序列形状 (5, 3)
 - **三流并行**:
   - StreamDNN1: Conv1D(3→256) × 2 + BiLSTM(256→256) + FC(512→4096)
-  - StreamDNN2: Conv1D(3→128) × 2 + BiLSTM(128→128) + FC(256→4096)
-  - StreamDNN3: Conv1D(3→256) × 1 + BiLSTM(256→128) + FC(256→4096)
-- **融合**: 三流输出拼接 (4096×3) → FC(12288→256) → FC(256→5)
-- **训练**: 5 epoch，Adam lr=1e-4，StepLR step=2 gamma=0.5，patience=3 早停，梯度裁剪 max_norm=1.0
+  - StreamDNN2: Conv1D(3→128) × 2 + BiLSTM(128→32) + FC(64→4096)
+  - StreamDNN3: Conv1D(3→256) × 1 + **单向** LSTM(256→128) + FC(128→4096)
+- **融合**: 三流输出拼接 (4096×3) → **直接 FC(12288→5)** （无中间 FC 层）
+- **训练**: 5 epoch，SGD(lr=0.001, momentum=0.9)，StepLR step=2 gamma=0.5，patience=3 早停
 
 ### 验证
 
-- **LOSO 交叉验证**: 10 折留一受试者验证
+- **LOSO 交叉验证**: 20 折留一受试者验证（MIntPAIN 共 20 名受试者）
 
 ---
 
@@ -82,10 +82,10 @@
 
 ### 可能改进方向
 
-1. **增大 bottleneck_dim** (如 8→16) 和 **pca_dim** (如 3→6)，保留更多特征信息
-2. **加长时序窗口** (如 sequence_length=10→15)，捕捉更长程的疼痛变化
-3. **损失函数加权**，缓解类别不平衡
-4. **尝试不同骨干网络**，如 ResNet50 或专门的面部表情预训练模型
+1. **获取 VGGFace 预训练权重**: 下载并转换原始 VGGFace Caffe 模型，替换 ImageNet 回退权重
+2. **加长时序窗口** (如 sequence_length=10)，捕捉更长程的疼痛变化
+3. **损失函数加权**，进一步缓解类别不平衡
+4. **启用人脸对齐** (preprocess.py 中设置 align=True) 可能提升特征质量
 
 ---
 
@@ -137,5 +137,5 @@ python main.py --skip_train
 | undersample | True | 训练欠采样平衡 |
 | feature_extractor_epochs | 50 | 微调 epoch 数 |
 | ensemble_epochs | 5 | 集成模型 epoch 数 |
-| num_folds | 10 | LOSO 折数 |
-| feature_backbone | inceptionresnet_vggface2 | 骨干网络 |
+| num_folds | 0 (全部20折) | LOSO 折数 |
+| feature_backbone | vgg16 | 骨干网络 |

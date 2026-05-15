@@ -14,8 +14,8 @@ class Config:
         self.weights_dir = os.path.join(self.mintpain_root, "weights")
         self.output_dir = os.path.join(self.mintpain_root, "results")
 
-        self.vggface_weights_path = os.path.join(self.weights_dir, "vgg_face2.pth")
-        self.feature_backbone = "inceptionresnet_vggface2"
+        self.vggface_weights_path = os.path.join(self.weights_dir, "vgg_face_dag.pth")
+        self.feature_backbone = "vgg16"
 
         self.num_classes = 5
         self.sequence_length = 5
@@ -23,16 +23,16 @@ class Config:
         self.pca_dim = 3
         self.undersample = True
 
-        self.feature_extractor_lr = 1e-4
-        self.feature_extractor_backbone_lr = 1e-5
+        self.feature_extractor_lr = 0.001
+        self.feature_extractor_backbone_lr = 0.0
         self.feature_extractor_batch_size = 48
         self.feature_extractor_epochs = 50
 
-        self.ensemble_lr = 1e-4
+        self.ensemble_lr = 0.001
         self.ensemble_batch_size = 48
         self.ensemble_epochs = 5
 
-        self.num_folds = 10
+        self.num_folds = 0
         self.device = "cuda"
 
         for directory in [

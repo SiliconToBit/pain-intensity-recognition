@@ -11,7 +11,7 @@ from model import EnsembleEDLM
 from utils.dataset import FoldSequenceDataset
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, max_grad_norm=1.0):
+def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     preds, labels = [], []
@@ -24,7 +24,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device, max_grad_norm=1
         logits = model(features)
         loss = criterion(logits, targets)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
 
         total_loss += loss.item()
@@ -120,7 +119,7 @@ def train_and_evaluate(config):
 
         model = EnsembleEDLM(num_classes=config.num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.ensemble_lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=config.ensemble_lr, momentum=0.9)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
 
         best_val_loss = float("inf")
@@ -130,7 +129,7 @@ def train_and_evaluate(config):
 
         for epoch in range(config.ensemble_epochs):
             train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, max_grad_norm=1.0
+                model, train_loader, optimizer, criterion, device
             )
             scheduler.step()
 
