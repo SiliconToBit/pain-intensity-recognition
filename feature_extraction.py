@@ -84,6 +84,7 @@ def generate_5frame_windows(sweep_frames, window_size=5, slide_step=1):
     fine-grained temporal changes and increase training data volume.
     Step=5 (non-overlapping) reduces data by 5× and is NOT recommended.
     """
+    windows = []
     for (subject_id, sweep_id), info in sweep_frames.items():
         frames = info["frames"]
         label = info["label"]
@@ -184,8 +185,8 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         print(f"  Undersampled to {len(train_frame_paths)} frames (balanced across {config.num_classes} classes)")
 
     dataset = FrameDataset(train_frame_paths, train_labels, transform=transform)
-    # 降低 num_workers 以避免多进程问题，使用 pin_memory 加速数据传输
-    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    # 单核 CPU 上多进程反而更慢，使用 num_workers=0 避免上下文切换开销
+    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     model = FeatureExtractor(
         num_classes=config.num_classes,

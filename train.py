@@ -114,8 +114,8 @@ def train_and_evaluate(config):
             print(f"Skipping {fold_name}: no data found.")
             continue
 
-        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=4)
-        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=0)
+        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=0)
 
         model = EnsembleEDLM(num_classes=config.num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
