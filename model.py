@@ -10,8 +10,7 @@ _VGGFACE_KEY_MAP = {
     "classifier.3": "fc7",   # fc7: 4096 → 4096
     # classifier.6 (fc8: 4096 → 2622) is intentionally skipped —
     # VGGFace was trained for 2622-way face ID; we replace it with
-    # our own bottleneck for pain intensity regression.
-}
+    }
 
 
 def load_vggface_weights(model, weights_path):
