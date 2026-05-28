@@ -129,7 +129,7 @@ python main.py --skip_train
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| mintpain_root | /home/featurize/work/dataset/mintpain | 数据集根目录 |
+| mintpain_root | 相对 `config.py` 的 `../dataset/mintpain` | 数据集根目录 |
 | num_classes | 5 | 疼痛等级 |
 | sequence_length | 5 | 时序窗口长度 |
 | bottleneck_dim | 4 | 特征瓶颈维度 |
