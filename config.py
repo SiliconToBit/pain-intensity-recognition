@@ -26,11 +26,11 @@ class Config:
 
         self.feature_extractor_lr = 0.001
         self.feature_extractor_backbone_lr = 0.0
-        self.feature_extractor_batch_size = 96
+        self.feature_extractor_batch_size = 192
         self.feature_extractor_epochs = 50
 
         self.ensemble_lr = 0.001
-        self.ensemble_batch_size = 96
+        self.ensemble_batch_size = 192
         self.ensemble_epochs = 5
 
         self.num_folds = 0

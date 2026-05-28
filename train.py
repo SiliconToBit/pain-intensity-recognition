@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report, confusion_matrix
 from sklearn.preprocessing import label_binarize
 
@@ -15,16 +16,19 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     preds, labels = [], []
+    scaler = GradScaler()
 
     for batch in dataloader:
         features = batch["features"].to(device)
         targets = batch["label"].to(device)
 
         optimizer.zero_grad()
-        logits = model(features)
-        loss = criterion(logits, targets)
-        loss.backward()
-        optimizer.step()
+        with autocast():
+            logits = model(features)
+            loss = criterion(logits, targets)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         preds.extend(logits.argmax(dim=1).cpu().numpy())
@@ -114,8 +118,8 @@ def train_and_evaluate(config):
             print(f"Skipping {fold_name}: no data found.")
             continue
 
-        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=0)
+        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
         model = EnsembleEDLM(num_classes=config.num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
@@ -139,8 +143,9 @@ def train_and_evaluate(config):
                 for batch in test_loader:
                     features = batch["features"].to(device)
                     targets = batch["label"].to(device)
-                    logits = model(features)
-                    val_loss += criterion(logits, targets).item()
+                    with autocast():
+                        logits = model(features)
+                        val_loss += criterion(logits, targets).item()
             val_loss /= len(test_loader)
 
             if (epoch + 1) % 1 == 0:

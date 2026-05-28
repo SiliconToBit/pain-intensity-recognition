@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 from PIL import Image
 from sklearn.decomposition import PCA
@@ -185,8 +186,7 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         print(f"  Undersampled to {len(train_frame_paths)} frames (balanced across {config.num_classes} classes)")
 
     dataset = FrameDataset(train_frame_paths, train_labels, transform=transform)
-    # 单核 CPU 上多进程反而更慢，使用 num_workers=0 避免上下文切换开销
-    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=config.feature_extractor_batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     model = FeatureExtractor(
         num_classes=config.num_classes,
@@ -202,6 +202,7 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         momentum=0.9,
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    scaler = GradScaler()
 
     best_loss = float("inf")
     patience = 5
@@ -219,16 +220,17 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
                 imgs = imgs.to(device)
                 lbls = lbls.to(device)
                 optimizer.zero_grad()
-                outputs = model(imgs)
-                loss = criterion(outputs, lbls)
-                loss.backward()
-                optimizer.step()
+                with autocast():
+                    outputs = model(imgs)
+                    loss = criterion(outputs, lbls)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 total_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += lbls.size(0)
                 correct += predicted.eq(lbls).sum().item()
                 batch_count += 1
-                # 更新进度条显示
                 avg_loss = total_loss / batch_count
                 acc = 100. * correct / total if total > 0 else 0
                 pbar.set_postfix({"loss": f"{avg_loss:.4f}", "acc": f"{acc:.2f}%"})

@@ -4,16 +4,24 @@ import torch.nn as nn
 import torchvision.models as models
 
 
+# VGGFace converted weight keys → our model's layer names
+_VGGFACE_KEY_MAP = {
+    "classifier.0": "fc6",   # fc6: 25088 → 4096
+    "classifier.3": "fc7",   # fc7: 4096 → 4096
+    # classifier.6 (fc8: 4096 → 2622) is intentionally skipped —
+    # VGGFace was trained for 2622-way face ID; we replace it with
+    # our own bottleneck for pain intensity regression.
+}
+
+
 def load_vggface_weights(model, weights_path):
-    """Load VGGFace weights (converted from .t7 via convert_weights.py) into VGG16.
+    """Load VGGFace weights (converted from .t7 via convert_weights.py).
 
-    The converted .pth contains torchvision VGG16-compatible keys:
-    - features.N.weight/bias (13 conv layers)
-    - classifier.0/3/6.weight/bias (3 FC layers)
+    Supports both direct key matching (features.N.*) and remapped
+    classifier keys (classifier.0 → fc6, classifier.3 → fc7).
 
-    We copy only the matching keys into the model, leaving non-matching keys
-    (e.g., classifier.6 which is 2622-dim vs our 1000-dim ImageNet head)
-    to use ImageNet pretrained values as fallback.
+    classifier.6 (fc8, 2622-dim) is skipped because we replace it
+    with a task-specific bottleneck head.
     """
     if not weights_path or not os.path.exists(weights_path):
         print(f"[WARNING] VGGFace weights not found at: {weights_path}")
@@ -34,10 +42,23 @@ def load_vggface_weights(model, weights_path):
     skipped = 0
 
     for k, v in state_dict.items():
+        # 1) Try direct key match (for features.N.*, etc.)
         if k in model_state and v.shape == model_state[k].shape:
             model_state[k] = v
             matched += 1
-        else:
+            continue
+
+        # 2) Try remapped keys (classifier.0 → fc6, classifier.3 → fc7)
+        mapped = False
+        for old_prefix, new_prefix in _VGGFACE_KEY_MAP.items():
+            if k.startswith(old_prefix):
+                new_k = k.replace(old_prefix, new_prefix)
+                if new_k in model_state and v.shape == model_state[new_k].shape:
+                    model_state[new_k] = v
+                    matched += 1
+                    mapped = True
+                break
+        if not mapped:
             skipped += 1
 
     if matched == 0:
@@ -52,13 +73,20 @@ def load_vggface_weights(model, weights_path):
 
 
 class FeatureExtractor(nn.Module):
-    """Standard VGG16 backbone with VGGFace pretrained weights, frozen conv layers.
+    """VGGFace fine-tuned feature extractor (early fusion).
 
-    Architecture follows the original paper:
-    - VGG16 (5 conv blocks) pretrained on VGGFace (Oxford 2015)
-    - All convolutional layers completely frozen
-    - Bottleneck: 25088 -> 4096 -> ReLU -> Dropout -> 4
-    - Classifier: 4 -> num_classes
+    Architecture follows the original EDLM paper:
+    1. VGG16 conv blocks (5 blocks, frozen) — VGGFace pretrained
+    2. fc6 (25088→4096) — VGGFace pretrained, fine-tunable
+    3. fc7 (4096→4096) — VGGFace pretrained, fine-tunable
+    4. New bottleneck: 4096 → 4096 → ReLU → Dropout → 4 (per-image features)
+    5. Classifier head: 4 → num_classes
+
+    Key difference from naive VGG16 transfer:
+    - fc6 and fc7 are KEPT from VGGFace (not discarded), leveraging
+      pretrained high-level face representations.
+    - Only fc8 (2622-way face ID) is replaced with a task-specific
+      bottleneck for pain intensity.
     """
 
     def __init__(self, num_classes=5, bottleneck_dim=4, vggface_weights_path=None, backbone="vgg16"):
@@ -67,6 +95,8 @@ class FeatureExtractor(nn.Module):
 
         # Standard VGG16 (no batch-norm, matching original VGGFace)
         vgg = models.vgg16(weights='IMAGENET1K_V1')
+
+        # --- Conv blocks (frozen) ---
         self.features = vgg.features
         self.avgpool = vgg.avgpool
 
@@ -74,26 +104,51 @@ class FeatureExtractor(nn.Module):
         for param in self.features.parameters():
             param.requires_grad = False
 
-        # Load VGGFace pretrained weights if available
+        # --- fc6 and fc7 from VGGFace (fine-tunable) ---
+        # These are the pretrained VGGFace dense layers that encode
+        # high-level facial representations. We keep them and allow
+        # fine-tuning for the pain recognition task.
+        self.fc6 = vgg.classifier[0]   # Linear(25088, 4096)
+        self.fc6_relu = nn.ReLU(inplace=True)
+        self.fc6_drop = nn.Dropout()
+        self.fc7 = vgg.classifier[3]   # Linear(4096, 4096)
+        self.fc7_relu = nn.ReLU(inplace=True)
+        self.fc7_drop = nn.Dropout()
+
+        # Load VGGFace pretrained weights (fills features.*, fc6, fc7)
         if vggface_weights_path:
             load_vggface_weights(self, vggface_weights_path)
 
-        # Bottleneck: 25088 -> 4096 -> 4 (matching original paper Figure 3)
+        # --- New bottleneck (replaces fc8) ---
+        # Paper: "在VGGFace顶部创建新的Dense连接层"
+        # fc8 originally did 4096→2622 (face identity classification).
+        # We replace it with a task-specific bottleneck for pain features.
         self.bottleneck = nn.Sequential(
-            nn.Linear(25088, 4096),
+            nn.Linear(4096, 4096),
             nn.ReLU(inplace=True),
             nn.Dropout(),
             nn.Linear(4096, bottleneck_dim),
         )
 
+        # --- Classifier head ---
         self.classifier = nn.Linear(bottleneck_dim, num_classes)
 
     def forward(self, x, return_features=False):
+        # Conv blocks
         x = self.features(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+
+        # VGGFace pretrained fc6 + fc7 (fine-tunable)
+        x = self.fc6_drop(self.fc6_relu(self.fc6(x)))
+        x = self.fc7_drop(self.fc7_relu(self.fc7(x)))
+
+        # Task-specific bottleneck → 4-dim per-image features
         features = self.bottleneck(x)
+
+        # Classification head
         out = self.classifier(features)
+
         if return_features:
             return features
         return out
