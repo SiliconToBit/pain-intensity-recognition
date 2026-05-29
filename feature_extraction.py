@@ -12,6 +12,13 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 from model import FeatureExtractor
+from utils.checkpoint import (
+    save_feature_extraction_checkpoint,
+    load_feature_extraction_checkpoint,
+    save_progress,
+    load_progress,
+    cleanup_old_checkpoints,
+)
 
 
 FRAME_PATTERN = re.compile(r"RGB-(\d+)-(\d+)-(\d+)-(\d+)\.\w+")
@@ -175,7 +182,7 @@ def undersample_to_balance(frame_paths, frame_labels, num_classes=5):
     return balanced_paths, balanced_labels
 
 
-def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx):
+def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx, resume=False):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     transform = get_transform(train=True, backbone=config.feature_backbone)
 
@@ -207,9 +214,22 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
     best_loss = float("inf")
     patience = 5
     patience_counter = 0
+    start_epoch = 0
+
+    # Load checkpoint if resuming
+    if resume:
+        ckpt, start_epoch = load_feature_extraction_checkpoint(config, fold_idx, device)
+        if ckpt is not None:
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+            best_loss = ckpt["best_loss"]
+            patience_counter = ckpt["patience_counter"]
+            print(f"  ✓ Resumed from epoch {start_epoch}, best_loss={best_loss:.4f}")
 
     print(f"  Starting fine-tuning for fold {fold_idx}...")
-    for epoch in range(config.feature_extractor_epochs):
+    for epoch in range(start_epoch, config.feature_extractor_epochs):
         model.train()
         total_loss = 0
         correct = 0
@@ -238,6 +258,12 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
         avg_loss = total_loss / len(loader)
         acc = 100. * correct / total if total > 0 else 0
         print(f"✓ Fold {fold_idx} | Epoch {epoch+1}/{config.feature_extractor_epochs} | Loss: {avg_loss:.4f} | Acc: {acc:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Save checkpoint every epoch
+        save_feature_extraction_checkpoint(
+            config, fold_idx, epoch, model, optimizer, scheduler, scaler, best_loss, patience_counter
+        )
+        
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
@@ -250,6 +276,9 @@ def finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx
                 print(f"  ⏹️  Early stopping at epoch {epoch+1}")
                 break
 
+    # Cleanup old checkpoints to save disk space
+    cleanup_old_checkpoints(config, "feature_extraction", keep_last_n=2)
+    
     print(f"Saved best feature extractor for fold {fold_idx}")
     model.load_state_dict(torch.load(os.path.join(config.weights_dir, f"feature_extractor_fold{fold_idx:02d}.pth"), map_location=device))
     return model
@@ -272,7 +301,7 @@ def extract_4d_features(config, model, frame_paths, batch_size=48):
     return np.concatenate(all_features, axis=0)
 
 
-def extract_features(config):
+def extract_features(config, resume=False):
     loso_splits = load_loso_splits(config)
     all_fold_names = sorted(loso_splits.keys())
     if config.num_folds is not None and config.num_folds > 0:
@@ -280,9 +309,20 @@ def extract_features(config):
     else:
         fold_names = all_fold_names
 
+    # Load progress if resuming
+    completed_folds = []
+    if resume:
+        completed_folds, _ = load_progress(config, "feature_extraction")
+        print(f"Resuming feature extraction. {len(completed_folds)} folds already completed.")
+
     print(f"Using {len(fold_names)} folds for feature extraction (configured num_folds={config.num_folds}).")
 
     for fold_idx, fold_name in enumerate(fold_names):
+        # Skip completed folds
+        if resume and fold_name in completed_folds:
+            print(f"\n⏭️  Skipping {fold_name} (already completed)")
+            continue
+
         print(f"\n{'='*50}")
         print(f"Processing {fold_name} ({fold_idx + 1}/{len(fold_names)})")
         print(f"{'='*50}")
@@ -309,7 +349,7 @@ def extract_features(config):
         all_frame_paths = list(set(train_frame_paths) | set(test_frame_paths))
         all_frame_paths.sort()
 
-        model = finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx)
+        model = finetune_feature_extractor(config, train_frame_paths, train_labels, fold_idx, resume=resume)
 
         print("Extracting 4D features for all frames...")
         all_features_4d = extract_4d_features(config, model, all_frame_paths)
@@ -359,6 +399,10 @@ def extract_features(config):
         pca_save_path = os.path.join(config.features_3d_dir, f"pca_{fold_name}.pkl")
         with open(pca_save_path, "wb") as f:
             pickle.dump(pca, f)
+
+        # Save progress
+        completed_folds.append(fold_name)
+        save_progress(config, "feature_extraction", completed_folds)
 
         print(f"Fold {fold_name} features saved to {fold_output_dir}")
 

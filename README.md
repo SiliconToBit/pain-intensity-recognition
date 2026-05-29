@@ -103,7 +103,8 @@
 └── utils/
     ├── dataset.py             # 时序数据集
     ├── download_utils.py      # 权重下载指引
-    └── face_alignment.py      # 人脸检测与对齐
+    ├── face_alignment.py      # 人脸检测与对齐
+    └── checkpoint.py          # 断点续训工具函数
 ```
 
 ## 环境配置
@@ -123,7 +124,80 @@ python main.py --skip_extraction
 
 # 仅特征提取
 python main.py --skip_train
+
+# 断点续训（从中断处继续）
+python main.py --resume
+
+# 仅恢复特征提取
+python main.py --resume --skip_train
+
+# 仅恢复集成训练
+python main.py --resume --skip_extraction
 ```
+
+## 断点续训功能
+
+支持云端训练场景下中途关闭实例后继续训练：
+
+### 功能特性
+- ✅ 自动保存 checkpoint（每个 epoch + 每个 fold）
+- ✅ 自动跳过已完成的 folds
+- ✅ 自动恢复训练状态（模型、优化器、学习率调度器、当前 epoch）
+- ✅ 自动清理旧 checkpoint（保留最近 2 个，节省磁盘空间）
+- ✅ 进度文件记录已完成的 folds
+
+### Checkpoint 存储位置
+```
+<output_dir>/checkpoints/
+├── feature_extraction/
+│   ├── fold00_latest.pth      # fold 0 最新 checkpoint
+│   ├── fold00_epoch001.pth    # fold 0 第 1 个 epoch
+│   └── ...
+├── ensemble/
+│   ├── fold00_latest.pth
+│   └── ...
+├── feature_extraction_progress.json
+└── ensemble_progress.json
+```
+
+### 工作流程
+1. 首次训练：`python main.py`
+2. 中途关闭实例（安全停止）
+3. 恢复训练：`python main.py --resume`
+4. 系统自动跳过已完成的 folds，从断点继续
+
+### 注意事项
+- Checkpoint 文件可能较大（每个约 100-200MB），确保有足够磁盘空间
+- 如果磁盘空间紧张，可手动删除 `checkpoints` 目录中的旧文件
+- `--resume` 参数适用于特征提取和集成训练两个阶段
+
+---
+
+## 训练优化
+
+针对 RTX 3080 (10.5GB) 等中端 GPU 的优化配置：
+
+| 优化项 | 原配置 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| num_workers | 2 | 4 | 充分利用多核 CPU，减少 IO 等待 |
+| batch_size | 192 | 256 | 充分利用显存，提升训练吞吐量 |
+| 混合精度训练 | - | autocast + GradScaler | 已启用，减少显存占用 |
+
+### 如果出现 CUDA OOM 错误
+将 `config.py` 中的 batch_size 调小：
+```python
+self.feature_extractor_batch_size = 192  # 或更小
+self.ensemble_batch_size = 192
+```
+
+### 快速验证配置
+首次运行建议先测试 1-2 个 folds：
+```python
+# config.py
+self.num_folds = 1  # 或 2
+```
+
+---
 
 ## 关键参数 (config.py)
 
@@ -137,5 +211,9 @@ python main.py --skip_train
 | undersample | True | 训练欠采样平衡 |
 | feature_extractor_epochs | 50 | 微调 epoch 数 |
 | ensemble_epochs | 5 | 集成模型 epoch 数 |
+| feature_extractor_batch_size | 256 | 特征提取 batch size |
+| ensemble_batch_size | 256 | 集成训练 batch size |
+| feature_extractor_lr | 0.001 | 特征提取学习率 |
+| ensemble_lr | 0.001 | 集成训练学习率 |
 | num_folds | 0 (全部20折) | LOSO 折数 |
 | feature_backbone | vgg16 | 骨干网络 |

@@ -99,7 +99,7 @@ class FeatureExtractor(nn.Module):
         self.features = vgg.features
         self.avgpool = vgg.avgpool
 
-        # Strictly freeze ALL convolutional layers (per original paper)
+        # Freeze ALL convolutional layers (per original paper)
         for param in self.features.parameters():
             param.requires_grad = False
 

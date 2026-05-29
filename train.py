@@ -10,6 +10,13 @@ from sklearn.preprocessing import label_binarize
 
 from model import EnsembleEDLM
 from utils.dataset import FoldSequenceDataset
+from utils.checkpoint import (
+    save_ensemble_checkpoint,
+    load_ensemble_checkpoint,
+    save_progress,
+    load_progress,
+    cleanup_old_checkpoints,
+)
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device):
@@ -78,7 +85,7 @@ def evaluate(model, dataloader, criterion, device, num_classes=5):
     return total_loss / len(dataloader), preds, labels, overall_auc, per_class_auc, cm, probs
 
 
-def train_and_evaluate(config):
+def train_and_evaluate(config, resume=False):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
 
     with open(config.loso_splits_path, "rb") as f:
@@ -90,6 +97,13 @@ def train_and_evaluate(config):
     else:
         fold_names = all_fold_names
     num_folds = len(fold_names)
+    
+    # Load progress if resuming
+    completed_folds = []
+    if resume:
+        completed_folds, _ = load_progress(config, "ensemble")
+        print(f"Resuming ensemble training. {len(completed_folds)} folds already completed.")
+    
     print(f"Using {num_folds} folds for training/evaluation (configured num_folds={config.num_folds}).")
 
     all_fold_accs = []
@@ -101,6 +115,11 @@ def train_and_evaluate(config):
     all_cm = np.zeros((config.num_classes, config.num_classes), dtype=int)
 
     for fold_idx, fold_name in enumerate(fold_names):
+        # Skip completed folds
+        if resume and fold_name in completed_folds:
+            print(f"\n⏭️  Skipping {fold_name} (already completed)")
+            continue
+        
         print(f"\n{'='*50}")
         print(f"Training Ensemble Model - {fold_name} ({fold_idx + 1}/{num_folds})")
         print(f"{'='*50}")
@@ -118,8 +137,8 @@ def train_and_evaluate(config):
             print(f"Skipping {fold_name}: no data found.")
             continue
 
-        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=config.ensemble_batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=config.ensemble_batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
         model = EnsembleEDLM(num_classes=config.num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
@@ -130,8 +149,20 @@ def train_and_evaluate(config):
         best_model_state = None
         patience = 3
         patience_counter = 0
+        start_epoch = 0
 
-        for epoch in range(config.ensemble_epochs):
+        # Load checkpoint if resuming
+        if resume:
+            ckpt, start_epoch = load_ensemble_checkpoint(config, fold_idx, device)
+            if ckpt is not None:
+                model.load_state_dict(ckpt["model_state_dict"])
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                best_val_loss = ckpt["best_val_loss"]
+                patience_counter = ckpt["patience_counter"]
+                print(f"  ✓ Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+
+        for epoch in range(start_epoch, config.ensemble_epochs):
             train_loss, train_preds, train_labels = train_epoch(
                 model, train_loader, optimizer, criterion, device
             )
@@ -152,6 +183,11 @@ def train_and_evaluate(config):
                 train_acc = accuracy_score(train_labels, train_preds)
                 print(f"  Epoch {epoch + 1}/{config.ensemble_epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Train Acc: {train_acc:.4f}")
 
+            # Save checkpoint every epoch
+            save_ensemble_checkpoint(
+                config, fold_idx, epoch, model, optimizer, scheduler, best_val_loss, patience_counter
+            )
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -161,6 +197,9 @@ def train_and_evaluate(config):
                 if patience_counter >= patience:
                     print(f"  Early stopping at epoch {epoch+1}")
                     break
+
+        # Cleanup old checkpoints to save disk space
+        cleanup_old_checkpoints(config, "ensemble", keep_last_n=2)
 
         if best_model_state:
             model.load_state_dict(best_model_state)
@@ -181,6 +220,9 @@ def train_and_evaluate(config):
         all_preds.extend(test_preds)
         all_labels.extend(test_labels)
         all_cm += cm
+
+        # Save progress
+        save_progress(config, "ensemble", processed_fold_names)
 
         test_subject = loso_splits[fold_name]["test_subject"]
         print(f"  {fold_name} ({test_subject}) | Acc: {fold_acc:.4f} | F1: {fold_f1:.4f} | AUC: {test_auc:.4f}")
