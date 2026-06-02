@@ -38,6 +38,9 @@ from model import PainRecognitionModel
 from utils.dataset import FrameSequenceDataset, get_train_transforms, get_test_transforms, undersample_windows, compute_class_weights
 from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, load_progress
 
+# GPU optimization
+torch.backends.cudnn.benchmark = True  # 加速固定输入尺寸的卷积
+
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
 
@@ -325,6 +328,13 @@ def train_and_evaluate(config, resume=False):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+        print(f"Batch size: {config.batch_size} | Workers: {config.num_workers}")
+        print(f"cudnn.benchmark: {torch.backends.cudnn.benchmark}")
+
     # Scan dataset directory
     print("Scanning dataset...")
     all_sweeps = scan_dataset(config)
@@ -403,10 +413,12 @@ def train_and_evaluate(config, resume=False):
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
         )
         test_loader = DataLoader(
             test_dataset, batch_size=config.batch_size, shuffle=False,
             num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
         )
 
         # Create model

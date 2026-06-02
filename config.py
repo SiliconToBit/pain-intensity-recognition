@@ -2,15 +2,23 @@ import os
 
 
 class Config:
-    """Configuration for ResNet-18 pain intensity recognition."""
+    """Configuration for ResNet-18 pain intensity recognition.
+
+    Path priority:
+        1. config YAML file
+        2. Environment variable MINTPAIN_ROOT
+        3. Default: <project_root>/../dataset/mintpain
+    """
 
     def __init__(self, config_path=None):
         project_root = os.path.dirname(os.path.abspath(__file__))
-        self.mintpain_root = os.path.abspath(os.path.join(project_root, "..", "dataset", "mintpain"))
-        self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
-        self.loso_splits_path = os.path.join(self.mintpain_root, "loso_splits.pkl")
-        self.samples_pkl_path = os.path.join(self.mintpain_root, "mintpain_edlm_samples.pkl")
 
+        # Dataset root: env var > default
+        self.mintpain_root = os.environ.get(
+            "MINTPAIN_ROOT",
+            os.path.abspath(os.path.join(project_root, "..", "dataset", "mintpain")),
+        )
+        self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
         self.output_dir = os.path.join(self.mintpain_root, "results")
 
         # Model
@@ -30,15 +38,15 @@ class Config:
         self.phase2_classifier_lr = 5e-4
         self.warmup_epochs = 3  # backbone warmup epochs in Phase 2
 
-        # Training
-        self.batch_size = 32
+        # Training (optimized for RTX 3080 10.5GB)
+        self.batch_size = 96
         self.patience = 5
         self.lstm_hidden_dim = 256
         self.lstm_num_layers = 1
         self.dropout = 0.5
 
         # Data & Class Imbalance
-        self.num_workers = 4
+        self.num_workers = 8
         self.undersample = True        # 欠采样多数类
         self.class_weight = "inverse"  # "none" | "inverse" | "sqrt_inverse"
         self.num_folds = 0  # 0 = all folds
