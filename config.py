@@ -2,6 +2,8 @@ import os
 
 
 class Config:
+    """Configuration for ResNet-18 pain intensity recognition."""
+
     def __init__(self, config_path=None):
         project_root = os.path.dirname(os.path.abspath(__file__))
         self.mintpain_root = os.path.abspath(os.path.join(project_root, "..", "dataset", "mintpain"))
@@ -9,38 +11,43 @@ class Config:
         self.loso_splits_path = os.path.join(self.mintpain_root, "loso_splits.pkl")
         self.samples_pkl_path = os.path.join(self.mintpain_root, "mintpain_edlm_samples.pkl")
 
-        self.features_dir = os.path.join(self.mintpain_root, "edlm_features")
-        self.features_4d_dir = os.path.join(self.features_dir, "4d")
-        self.features_3d_dir = os.path.join(self.features_dir, "3d")
-        self.weights_dir = os.path.join(self.mintpain_root, "weights")
         self.output_dir = os.path.join(self.mintpain_root, "results")
 
-        self.vggface_weights_path = os.path.join(self.weights_dir, "vgg_face_dag.pth")
-        self.feature_backbone = "vgg16"
-
+        # Model
         self.num_classes = 5
         self.sequence_length = 5
-        self.bottleneck_dim = 4
-        self.pca_dim = 3
-        self.undersample = True
+        self.backbone = "resnet18"
+        self.pretrained = True
+        self.backbone_frozen = True  # Phase 1: freeze backbone
 
-        self.feature_extractor_lr = 0.001
-        self.feature_extractor_backbone_lr = 0.0
-        self.feature_extractor_batch_size = 256
-        self.feature_extractor_epochs = 50
+        # Phase 1: train classifier only (backbone frozen)
+        self.phase1_epochs = 10
+        self.phase1_lr = 1e-3
 
-        self.ensemble_lr = 0.001
-        self.ensemble_batch_size = 256
-        self.ensemble_epochs = 5
+        # Phase 2: unfreeze backbone with lower LR
+        self.phase2_epochs = 20
+        self.phase2_backbone_lr = 5e-5
+        self.phase2_classifier_lr = 5e-4
+        self.warmup_epochs = 3  # backbone warmup epochs in Phase 2
 
-        self.num_folds = 0
+        # Training
+        self.batch_size = 32
+        self.patience = 5
+        self.lstm_hidden_dim = 256
+        self.lstm_num_layers = 1
+        self.dropout = 0.5
+
+        # Data & Class Imbalance
+        self.num_workers = 4
+        self.undersample = True        # 欠采样多数类
+        self.class_weight = "inverse"  # "none" | "inverse" | "sqrt_inverse"
+        self.num_folds = 0  # 0 = all folds
+
+        # Device
         self.device = "cuda"
 
-        for directory in [
-            self.features_dir, self.features_4d_dir, self.features_3d_dir,
-            self.weights_dir, self.output_dir,
-        ]:
-            os.makedirs(directory, exist_ok=True)
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
 
         if config_path and os.path.exists(config_path):
             self._load_config(config_path)

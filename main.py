@@ -1,36 +1,34 @@
 import argparse
-import os
-import sys
 
 from config import Config
-from feature_extraction import extract_features
 from train import train_and_evaluate
-from utils.download_utils import download_pretrained_weights
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EDLM MIntPAIN reproduce pipeline")
-    parser.add_argument("--config", type=str, default=None, help="Path to config file")
-    parser.add_argument("--skip_extraction", action="store_true", help="Skip feature extraction")
-    parser.add_argument("--skip_train", action="store_true", help="Skip training and evaluation")
-    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    parser = argparse.ArgumentParser(
+        description="Pain intensity recognition with ResNet-18 + LSTM"
+    )
+    parser.add_argument("--config", type=str, default=None, help="Path to config YAML file")
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
+    parser.add_argument("--num_folds", type=int, default=None, help="Number of LOSO folds (0=all)")
     args = parser.parse_args()
 
     config = Config(args.config)
 
+    if args.num_folds is not None:
+        config.num_folds = args.num_folds
+
     if args.resume:
-        print("🔄 Resume mode enabled - will skip completed folds and load checkpoints")
+        print("Resume mode enabled")
 
-    if not args.skip_extraction:
-        print("Starting feature extraction (fine-tuning + PCA)...")
-        download_pretrained_weights(config)
-        extract_features(config, resume=args.resume)
+    print(f"Model: {config.backbone} + LSTM")
+    print(f"Classes: {config.num_classes}")
+    print(f"Sequence length: {config.sequence_length}")
+    print(f"LOSO folds: {config.num_folds or 'all'}")
 
-    if not args.skip_train:
-        print("Starting ensemble training and evaluation...")
-        train_and_evaluate(config, resume=args.resume)
+    train_and_evaluate(config, resume=args.resume)
 
-    print("Pipeline completed successfully.")
+    print("\nPipeline completed.")
 
 
 if __name__ == "__main__":

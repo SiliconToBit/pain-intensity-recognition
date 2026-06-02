@@ -1,111 +1,77 @@
-# EDLM MIntPAIN — 疼痛强度识别
+# Pain Intensity Recognition — ResNet-18 + LSTM
 
-本项目复现 EDLM (Ensemble Deep Learning Model) 在 MIntPAIN 数据集上的 5 级疼痛强度分类。
+基于 ResNet-18 + LSTM 的疼痛强度识别模型，在 MIntPAIN 数据集上进行 5 级疼痛分类。
 
 ---
 
-## 总体架构
+## 模型架构
 
-### 特征提取（FeatureExtractor）
+### ResNet-18 + LSTM
 
-- **骨干网络**: 标准 VGG16，预训练于 VGGFace（Oxford 2015），**所有卷积层完全冻结**
-- **瓶颈层**: Linear(25088→4096) → ReLU → Dropout → Linear(4096→4)，输出 4 维特征
-- **微调**: 每折独立微调 50 epoch，SGD(lr=0.001, momentum=0.9)，StepLR 每 20 epoch 衰减 0.5，patience=5 早停
-- **降维**: PCA 将 4 维降至 3 维（训练集拟合，测试集变换，无数据泄露），验证方差保留 ≥ 99%
+端到端训练，无需中间特征提取步骤：
 
-### 时序分类（EnsembleEDLM）
+```
+输入: (B, T, C, H, W) — T帧图像序列
+  ↓ reshape to (B*T, C, H, W)
+ResNet-18 (ImageNet 预训练) → (B*T, 512)
+  ↓ reshape to (B, T, 512)
+LSTM → (B, hidden_dim)
+  ↓
+FC → (B, num_classes)
+```
 
-- **输入**: 滑动窗口 5 帧，步长 1 帧（重叠窗口），每帧 3 维 PCA 特征 → 序列形状 (5, 3)
-- **三流并行**:
-  - StreamDNN1: Conv1D(3→256) × 2 + BiLSTM(256→256) + FC(512→4096)
-  - StreamDNN2: Conv1D(3→128) × 2 + BiLSTM(128→32) + FC(64→4096)
-  - StreamDNN3: Conv1D(3→256) × 1 + **单向** LSTM(256→128) + FC(128→4096)
-- **融合**: 三流输出拼接 (4096×3) → **直接 FC(12288→5)** （无中间 FC 层）
-- **训练**: 5 epoch，SGD(lr=0.001, momentum=0.9)，StepLR step=2 gamma=0.5，patience=3 早停
+- **骨干网络**: ResNet-18，ImageNet 预训练
+- **时序建模**: LSTM (hidden_dim=256, 1 layer)
+- **分类头**: Dropout + Linear(256→5)
+
+### 训练策略（分阶段）
+
+| 阶段 | Backbone | 分类器 | Epochs | LR |
+|------|----------|--------|--------|----|
+| Phase 1 | 冻结 | 训练 | 10 | 5e-4 |
+| Phase 2 | 微调 (5e-5) | 训练 (5e-4) | 20 | 分组学习率 + warmup |
+
+**Phase 2 Warmup**: 前 3 个 epoch 线性提升 backbone LR 从 0 → 5e-5，稳定微调初期
+
+- **优化器**: Adam
+- **学习率调度**: ReduceLROnPlateau (monitor val loss)
+- **早停**: patience=5
+- **数据增强**: RandomHorizontalFlip, RandomAffine(±10°, ±5%平移)
 
 ### 验证
 
-- **LOSO 交叉验证**: 20 折留一受试者验证（MIntPAIN 共 20 名受试者）
+- **LOSO 交叉验证**: 20 折留一受试者验证
 
 ---
 
-## 实验结果
+## 评估指标
 
-### 总体指标 (10折 LOSO)
-
-| 指标 | 均值 | 标准差 |
-|------|------|--------|
-| Accuracy | 39.09% | ±10.38% |
-| F1 (weighted) | 30.07% | ±4.85% |
-| AUC (weighted) | 52.27% | ±4.70% |
-
-### 各类别 AUC
-
-| 类别 | 均值 AUC |
-|------|----------|
-| Class 0 (无痛) | 0.524 |
-| Class 1 | 0.518 |
-| Class 2 | 0.481 |
-| Class 3 | 0.542 |
-| Class 4 | 0.543 |
-
-### 混淆矩阵
-
-```
-          预测
-       0    1    2    3    4
-真实 0  1415  148  198  143  110
-     1   346   38   39   43   35
-     2   339   44   52   45   17
-     3   348   45   55   36   28
-     4   336   39   58   42   29
-```
-
-### 分类报告
-
-| 类别 | 精确率 | 召回率 | F1 | 支持数 |
-|------|--------|--------|-----|--------|
-| 0 | 0.51 | 0.70 | 0.59 | 2014 |
-| 1 | 0.12 | 0.08 | 0.09 | 501 |
-| 2 | 0.13 | 0.10 | 0.12 | 497 |
-| 3 | 0.12 | 0.07 | 0.09 | 512 |
-| 4 | 0.13 | 0.06 | 0.08 | 504 |
-
----
-
-## 分析
-
-- **优于随机**: 39% 准确率对比随机基线 20%，模型学到了一定模式
-- **严重偏向无痛类**: Class 0 召回率 70%，但其余 4 类召回率均低于 10%，大量疼痛样本被误判为无痛
-- **类别不平衡**: 测试集无痛帧占 50%，模型倾向于多数类
-- **区分度不足**: AUC ~0.52 接近随机，疼痛等级间区分困难
-
-### 可能改进方向
-
-1. **获取 VGGFace 预训练权重**: 下载并转换原始 VGGFace Caffe 模型，替换 ImageNet 回退权重
-2. **加长时序窗口** (如 sequence_length=10)，捕捉更长程的疼痛变化
-3. **损失函数加权**，进一步缓解类别不平衡
-4. **启用人脸对齐** (preprocess.py 中设置 align=True) 可能提升特征质量
+| 指标 | 说明 |
+|------|------|
+| **Weighted F1-score** | 对类别不平衡敏感，按样本数加权 |
+| **Macro F1-score** | 各类别同等权重 |
+| **Per-class Recall** | 每个疼痛等级的召回率 |
+| **Confusion Matrix** | 分析相邻等级的混淆情况 |
+| **Cohen's Kappa** | 校正偶然一致性 |
+| **Multi-class AUROC** | 整体区分能力 (OvR) |
 
 ---
 
 ## 项目结构
 
 ```
-├── README.md                  # 使用说明 & 实验结果
-├── requirements.txt           # 依赖清单
-├── main.py                    # 一键运行主脚本
-├── config.py                  # 所有可配置参数
-├── model.py                   # FeatureExtractor + EnsembleEDLM
-├── feature_extraction.py      # 微调、4D特征提取、PCA降维、窗口生成
-├── train.py                   # LOSO训练评估
-├── continue_training.py       # 续跑脚本（跳过已完成折）
+├── README.md               # 使用说明
+├── requirements.txt        # 依赖清单
+├── main.py                 # 主入口
+├── config.py               # 配置参数
+├── model.py                # ResNet-18 + LSTM 模型
+├── train.py                # 训练、评估、指标计算
 └── utils/
-    ├── dataset.py             # 时序数据集
-    ├── download_utils.py      # 权重下载指引
-    ├── face_alignment.py      # 人脸检测与对齐
-    └── checkpoint.py          # 断点续训工具函数
+    ├── dataset.py           # 图像序列数据集
+    └── checkpoint.py        # 断点续训工具
 ```
+
+---
 
 ## 环境配置
 
@@ -116,104 +82,66 @@ pip install -r requirements.txt
 ## 使用方法
 
 ```bash
-# 完整流程
+# 完整 LOSO 交叉验证
 python main.py
 
-# 仅训练集成模型
-python main.py --skip_extraction
+# 快速验证（1-2 折）
+python main.py --num_folds 1
 
-# 仅特征提取
-python main.py --skip_train
-
-# 断点续训（从中断处继续）
+# 断点续训
 python main.py --resume
 
-# 仅恢复特征提取
-python main.py --resume --skip_train
-
-# 仅恢复集成训练
-python main.py --resume --skip_extraction
-```
-
-## 断点续训功能
-
-支持云端训练场景下中途关闭实例后继续训练：
-
-### 功能特性
-- ✅ 自动保存 checkpoint（每个 epoch + 每个 fold）
-- ✅ 自动跳过已完成的 folds
-- ✅ 自动恢复训练状态（模型、优化器、学习率调度器、当前 epoch）
-- ✅ 自动清理旧 checkpoint（保留最近 2 个，节省磁盘空间）
-- ✅ 进度文件记录已完成的 folds
-
-### Checkpoint 存储位置
-```
-<output_dir>/checkpoints/
-├── feature_extraction/
-│   ├── fold00_latest.pth      # fold 0 最新 checkpoint
-│   ├── fold00_epoch001.pth    # fold 0 第 1 个 epoch
-│   └── ...
-├── ensemble/
-│   ├── fold00_latest.pth
-│   └── ...
-├── feature_extraction_progress.json
-└── ensemble_progress.json
-```
-
-### 工作流程
-1. 首次训练：`python main.py`
-2. 中途关闭实例（安全停止）
-3. 恢复训练：`python main.py --resume`
-4. 系统自动跳过已完成的 folds，从断点继续
-
-### 注意事项
-- Checkpoint 文件可能较大（每个约 100-200MB），确保有足够磁盘空间
-- 如果磁盘空间紧张，可手动删除 `checkpoints` 目录中的旧文件
-- `--resume` 参数适用于特征提取和集成训练两个阶段
-
----
-
-## 训练优化
-
-针对 RTX 3080 (10.5GB) 等中端 GPU 的优化配置：
-
-| 优化项 | 原配置 | 优化后 | 效果 |
-|--------|--------|--------|------|
-| num_workers | 2 | 4 | 充分利用多核 CPU，减少 IO 等待 |
-| batch_size | 192 | 256 | 充分利用显存，提升训练吞吐量 |
-| 混合精度训练 | - | autocast + GradScaler | 已启用，减少显存占用 |
-
-### 如果出现 CUDA OOM 错误
-将 `config.py` 中的 batch_size 调小：
-```python
-self.feature_extractor_batch_size = 192  # 或更小
-self.ensemble_batch_size = 192
-```
-
-### 快速验证配置
-首次运行建议先测试 1-2 个 folds：
-```python
-# config.py
-self.num_folds = 1  # 或 2
+# 使用配置文件
+python main.py --config my_config.yaml
 ```
 
 ---
 
-## 关键参数 (config.py)
+## 配置参数 (config.py)
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| mintpain_root | 相对 `config.py` 的 `../dataset/mintpain` | 数据集根目录 |
 | num_classes | 5 | 疼痛等级 |
 | sequence_length | 5 | 时序窗口长度 |
-| bottleneck_dim | 4 | 特征瓶颈维度 |
-| pca_dim | 3 | PCA 降维维度 |
+| backbone | resnet18 | 骨干网络 |
+| pretrained | True | 使用 ImageNet 预训练 |
+| phase1_epochs | 20 | Phase 1 训练轮数 |
+| phase2_epochs | 10 | Phase 2 训练轮数 |
+| phase1_lr | 1e-3 | Phase 1 学习率 |
+| phase2_backbone_lr | 1e-4 | Phase 2 backbone 学习率 |
+| phase2_classifier_lr | 1e-3 | Phase 2 分类器学习率 |
+| batch_size | 32 | 批量大小 |
+| patience | 5 | 早停耐心值 |
+| lstm_hidden_dim | 256 | LSTM 隐藏维度 |
+| lstm_num_layers | 1 | LSTM 层数 |
+| dropout | 0.5 | Dropout 比率 |
 | undersample | True | 训练欠采样平衡 |
-| feature_extractor_epochs | 50 | 微调 epoch 数 |
-| ensemble_epochs | 5 | 集成模型 epoch 数 |
-| feature_extractor_batch_size | 256 | 特征提取 batch size |
-| ensemble_batch_size | 256 | 集成训练 batch size |
-| feature_extractor_lr | 0.001 | 特征提取学习率 |
-| ensemble_lr | 0.001 | 集成训练学习率 |
-| num_folds | 0 (全部20折) | LOSO 折数 |
-| feature_backbone | vgg16 | 骨干网络 |
+| class_weight | inverse | 类别加权 (none/inverse/sqrt_inverse) |
+| num_folds | 0 (全部) | LOSO 折数 |
+
+---
+
+## 输出
+
+训练完成后，结果保存在 `<output_dir>/`:
+
+```
+├── results.json           # 所有指标汇总
+├── predictions.npy        # 预测结果
+├── labels.npy             # 真实标签
+├── probabilities.npy      # 预测概率
+├── confusion_matrix.npy   # 混淆矩阵
+└── checkpoints/           # 模型 checkpoint
+```
+
+---
+
+## Checkpoint 断点续训
+
+```
+<output_dir>/checkpoints/
+├── fold00_latest.pth      # fold 0 最新 checkpoint
+├── fold00_epoch001.pth    # fold 0 第 1 个 epoch
+├── train_progress.json    # 已完成的 folds
+└── ...
+```
