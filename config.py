@@ -14,9 +14,11 @@ class Config:
         project_root = os.path.dirname(os.path.abspath(__file__))
 
         # Dataset root: env var > default
+        # 默认路径: 项目目录向上两级/dataset/mintpain
+        # 适用于: Workspace/ 下同时有 dataset/ 和 ai_projects/ 的结构
         self.mintpain_root = os.environ.get(
             "MINTPAIN_ROOT",
-            os.path.abspath(os.path.join(project_root, "..", "dataset", "mintpain")),
+            os.path.abspath(os.path.join(project_root, "..", "..", "dataset", "mintpain")),
         )
         self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
         self.output_dir = os.path.join(self.mintpain_root, "results")
