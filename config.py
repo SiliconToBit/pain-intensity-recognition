@@ -18,7 +18,7 @@ class Config:
         # 适用于: Workspace/ 下同时有 dataset/ 和 ai_projects/ 的结构
         self.mintpain_root = os.environ.get(
             "MINTPAIN_ROOT",
-            os.path.abspath(os.path.join(project_root, "..", "..", "dataset", "mintpain")),
+            "/home/featurize/data",
         )
         self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
         self.output_dir = os.path.join(self.mintpain_root, "results")

@@ -330,7 +330,7 @@ def train_and_evaluate(config, resume=False):
 
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
         print(f"Batch size: {config.batch_size} | Workers: {config.num_workers}")
         print(f"cudnn.benchmark: {torch.backends.cudnn.benchmark}")
