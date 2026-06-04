@@ -459,6 +459,8 @@ def train_and_evaluate(config, resume=False):
         model = PainRecognitionModel(
             num_classes=config.num_classes,
             pretrained=config.pretrained,
+            pretrained_source=config.pretrained_source,
+            weights_path=config.vggface2_weights_path,
             lstm_hidden_dim=config.lstm_hidden_dim,
             lstm_num_layers=config.lstm_num_layers,
             dropout=config.dropout,
@@ -526,6 +528,8 @@ def train_and_evaluate(config, resume=False):
                     break
 
         # ── Phase 2: Unfreeze backbone, train with different LR + warmup ──
+        # Save Phase 1 best model as fallback
+        phase1_best_state = best_model_state
         print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
         model.unfreeze_backbone()
         param_groups = model.get_param_groups(
@@ -537,7 +541,10 @@ def train_and_evaluate(config, resume=False):
             optimizer, mode="min", factor=0.5, patience=2,
         )
 
+        # Reset early stopping state for Phase 2
+        best_val_loss = float("inf")
         patience_counter = 0
+        best_model_state = None
         phase2_epochs = phase1_end + config.phase2_epochs
 
         for epoch in range(phase1_end, phase2_epochs):
@@ -585,9 +592,13 @@ def train_and_evaluate(config, resume=False):
                     print(f"  Early stopping at epoch {epoch+1}")
                     break
 
-        # Load best model and evaluate
+        # Load best model: prefer Phase 2 best, fall back to Phase 1 best
         if best_model_state:
             model.load_state_dict(best_model_state)
+            print(f"  Using Phase 2 best model (val_loss={best_val_loss:.4f})")
+        elif phase1_best_state:
+            model.load_state_dict(phase1_best_state)
+            print(f"  Phase 2 did not improve, using Phase 1 best model")
         model.to(device)
 
         _, fold_preds, fold_labels, fold_probs = evaluate(

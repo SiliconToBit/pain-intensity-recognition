@@ -7,15 +7,56 @@ class ResNet18FeatureExtractor(nn.Module):
     """ResNet-18 backbone for per-frame feature extraction.
 
     Removes the final FC layer, outputs 512-dim features.
+    Supports ImageNet or VGGFace2 pretrained weights.
     """
 
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, pretrained_source="imagenet", weights_path=None):
         super().__init__()
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        resnet = models.resnet18(weights=weights)
+        resnet = models.resnet18(weights=None)  # Always create without weights first
+
+        if pretrained:
+            if pretrained_source == "vggface2":
+                self._load_vggface2_weights(resnet, weights_path)
+            else:
+                # Default: ImageNet pretrained
+                imagenet_weights = models.ResNet18_Weights.DEFAULT
+                resnet = models.resnet18(weights=imagenet_weights)
+
         # Remove the final FC layer
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 512
+
+    def _load_vggface2_weights(self, resnet, weights_path):
+        """Load VGGFace2 pretrained weights into ResNet-18."""
+        import os
+        if not weights_path or not os.path.exists(weights_path):
+            raise FileNotFoundError(
+                f"VGGFace2 weights not found at: {weights_path}\n"
+                f"Run: python download_vggface2.py"
+            )
+        state_dict = torch.load(weights_path, map_location="cpu")
+
+        # Handle different weight file formats
+        # Some files have 'state_dict' or 'model_state_dict' key
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        elif "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+
+        # Remove 'module.' prefix if present (DataParallel saves with this prefix)
+        cleaned = {}
+        for k, v in state_dict.items():
+            key = k.replace("module.", "")
+            # Skip the final FC layer (different num_classes)
+            if key.startswith("fc."):
+                continue
+            cleaned[key] = v
+
+        # Load with strict=False to handle any remaining mismatches
+        missing, unexpected = resnet.load_state_dict(cleaned, strict=False)
+        print(f"  Loaded VGGFace2 weights from: {weights_path}")
+        if missing:
+            print(f"  Missing keys (will use init): {missing}")
 
     def forward(self, x):
         """Extract features from a batch of images.
@@ -46,12 +87,18 @@ class PainRecognitionModel(nn.Module):
         self,
         num_classes=5,
         pretrained=True,
+        pretrained_source="imagenet",
+        weights_path=None,
         lstm_hidden_dim=256,
         lstm_num_layers=1,
         dropout=0.5,
     ):
         super().__init__()
-        self.feature_extractor = ResNet18FeatureExtractor(pretrained=pretrained)
+        self.feature_extractor = ResNet18FeatureExtractor(
+            pretrained=pretrained,
+            pretrained_source=pretrained_source,
+            weights_path=weights_path,
+        )
         feature_dim = self.feature_extractor.feature_dim
 
         self.lstm = nn.LSTM(
