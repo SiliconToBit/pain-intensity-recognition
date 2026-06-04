@@ -164,7 +164,7 @@ def build_loso_folds(sweeps):
     return folds
 
 
-def generate_windows(sweeps, window_size=5, slide_step=1):
+def generate_windows(sweeps, window_size=5, slide_step=2):
     """Generate overlapping frame windows from a list of sweeps."""
     windows = []
     for sweep in sweeps:
@@ -381,8 +381,8 @@ def train_and_evaluate(config, resume=False):
         print(f"Train sweeps: {len(train_sweeps)}, Test sweeps: {len(test_sweeps)}")
 
         # Generate frame windows
-        train_windows = generate_windows(train_sweeps, window_size=config.sequence_length, slide_step=1)
-        test_windows = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=1)
+        train_windows = generate_windows(train_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+        test_windows = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
         print(f"Train windows: {len(train_windows)}, Test windows: {len(test_windows)}")
 
         # Print class distribution
@@ -395,17 +395,19 @@ def train_and_evaluate(config, resume=False):
             print(f"Skipping {fold_name}: no windows generated")
             continue
 
+        # Compute class weights from ORIGINAL distribution (before any undersampling)
+        if config.class_weight != "none":
+            class_weights = compute_class_weights(
+                train_windows, num_classes=config.num_classes, mode=config.class_weight,
+            ).to(device)
+            print(f"  Class weights ({config.class_weight}): {class_weights.tolist()}")
+        else:
+            class_weights = None
+
         # Undersample training data
         if config.undersample:
             train_windows = undersample_windows(train_windows, num_classes=config.num_classes)
             print(f"Undersampled train windows: {len(train_windows)}")
-
-        # Compute class weights for imbalanced loss
-        class_weights = compute_class_weights(
-            train_windows, num_classes=config.num_classes, mode=config.class_weight,
-        ).to(device)
-        if config.class_weight != "none":
-            print(f"  Class weights ({config.class_weight}): {class_weights.tolist()}")
 
         # Create datasets and loaders
         train_dataset = FrameSequenceDataset(train_windows, transform=get_train_transforms())

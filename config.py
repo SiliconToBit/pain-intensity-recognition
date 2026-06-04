@@ -42,7 +42,8 @@ class Config:
 
         # Training (optimized for RTX 3080 10.5GB)
         self.batch_size = 96
-        self.patience = 5
+        self.patience = 7
+        self.slide_step = 2  # 滑动窗口步长 (1=最大重叠, 2=推荐, 5=无重叠)
         self.lstm_hidden_dim = 256
         self.lstm_num_layers = 1
         self.dropout = 0.5
