@@ -131,6 +131,17 @@ def scan_dataset(config):
     return sweeps
 
 
+def remap_to_binary(sweeps):
+    """Remap 5-class labels to binary: 0=no-pain, 1=pain.
+
+    Label 0 (无痛) → 0
+    Label 1-4 (有痛) → 1
+    """
+    for s in sweeps:
+        s["label"] = 0 if s["label"] == 0 else 1
+    return sweeps
+
+
 def build_loso_folds(sweeps):
     """Build Leave-One-Subject-Out folds from sweep list.
 
@@ -339,6 +350,11 @@ def train_and_evaluate(config, resume=False):
     print("Scanning dataset...")
     all_sweeps = scan_dataset(config)
     print(f"Found {len(all_sweeps)} sweeps across {len(set(s['subject_id'] for s in all_sweeps))} subjects")
+
+    # Binary mode: remap labels 0→0, 1-4→1
+    if config.binary_mode:
+        all_sweeps = remap_to_binary(all_sweeps)
+        print("Binary mode: remapped labels to 0 (no-pain) / 1 (pain)")
 
     # Build LOSO folds
     loso_folds = build_loso_folds(all_sweeps)

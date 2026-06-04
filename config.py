@@ -54,6 +54,9 @@ class Config:
         self.class_weight = "inverse"  # "none" | "inverse" | "sqrt_inverse"
         self.num_folds = 0  # 0 = all folds
 
+        # Task mode
+        self.binary_mode = False  # True: 有痛(1) vs 无痛(0), False: 5类疼痛等级
+
         # Device
         self.device = "cuda"
 

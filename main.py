@@ -14,6 +14,7 @@ def main():
                         help="Path to mintpain dataset root (overrides MINTPAIN_ROOT env var)")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--num_folds", type=int, default=None, help="Number of LOSO folds (0=all)")
+    parser.add_argument("--binary", action="store_true", help="Binary mode: pain (1) vs no-pain (0)")
     args = parser.parse_args()
 
     # Set env var before creating Config
@@ -25,13 +26,18 @@ def main():
     if args.num_folds is not None:
         config.num_folds = args.num_folds
 
+    if args.binary:
+        config.binary_mode = True
+        config.num_classes = 2
+
     if args.resume:
         print("Resume mode enabled")
 
+    mode_str = "Binary (pain vs no-pain)" if config.binary_mode else f"{config.num_classes}-class"
     print(f"Dataset: {config.preprocessed_dir}")
     print(f"Output:  {config.output_dir}")
     print(f"Model:   {config.backbone} + LSTM")
-    print(f"Classes: {config.num_classes}")
+    print(f"Task:    {mode_str}")
     print(f"LOSO folds: {config.num_folds or 'all'}")
 
     train_and_evaluate(config, resume=args.resume)
