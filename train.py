@@ -485,10 +485,15 @@ def train_and_evaluate(config, resume=False):
         if resume:
             ckpt, start_epoch = load_checkpoint(config, fold_idx, device)
             if ckpt is not None:
-                model.load_state_dict(ckpt["model_state_dict"])
-                best_val_loss = ckpt.get("best_val_loss", float("inf"))
-                patience_counter = ckpt.get("patience_counter", 0)
-                print(f"  Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+                try:
+                    model.load_state_dict(ckpt["model_state_dict"])
+                    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+                    patience_counter = ckpt.get("patience_counter", 0)
+                    print(f"  Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+                except (RuntimeError, KeyError) as e:
+                    print(f"  Checkpoint incompatible (different architecture), starting fresh: {e}")
+                    ckpt = None
+                    start_epoch = 0
 
         # ── Phase 1: Train classifier only (backbone frozen) ──
         print(f"\n  Phase 1: Training classifier (backbone frozen)")
