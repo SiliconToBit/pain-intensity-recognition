@@ -456,11 +456,18 @@ def train_and_evaluate(config, resume=False):
         )
 
         # Create model
+        # Resolve weights path for external pretrained models
+        weights_path = None
+        if config.pretrained_source == "arcface":
+            weights_path = os.path.join(config.pretrained_weights_path, "arcface_r50_backbone.pth")
+        elif config.pretrained_source == "vggface2":
+            weights_path = os.path.join(config.pretrained_weights_path, "resnet18_vggface2.pth")
+
         model = PainRecognitionModel(
             num_classes=config.num_classes,
             pretrained=config.pretrained,
             pretrained_source=config.pretrained_source,
-            weights_path=config.vggface2_weights_path,
+            weights_path=weights_path,
             lstm_hidden_dim=config.lstm_hidden_dim,
             lstm_num_layers=config.lstm_num_layers,
             dropout=config.dropout,

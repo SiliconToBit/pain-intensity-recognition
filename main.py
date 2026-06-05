@@ -15,7 +15,8 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--num_folds", type=int, default=None, help="Number of LOSO folds (0=all)")
     parser.add_argument("--binary", action="store_true", help="Binary mode: pain (1) vs no-pain (0)")
-    parser.add_argument("--vggface2", action="store_true", help="Use VGGFace2 pretrained weights")
+    parser.add_argument("--vggface2", action="store_true", help="Use VGGFace2 pretrained weights (facenet-pytorch)")
+    parser.add_argument("--arcface", action="store_true", help="Use ArcFace pretrained weights (insightface R50)")
     args = parser.parse_args()
 
     # Set env var before creating Config
@@ -26,6 +27,8 @@ def main():
 
     if args.vggface2:
         config.pretrained_source = "vggface2"
+    if args.arcface:
+        config.pretrained_source = "arcface"
 
     if args.num_folds is not None:
         config.num_folds = args.num_folds

@@ -28,8 +28,8 @@ class Config:
         self.sequence_length = 5
         self.backbone = "resnet18"
         self.pretrained = True
-        self.pretrained_source = "imagenet"  # "imagenet" or "vggface2"
-        self.vggface2_weights_path = os.path.join(project_root, "pretrained", "resnet18_vggface2.pth")
+        self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface"
+        self.pretrained_weights_path = os.path.join(project_root, "pretrained")
         self.backbone_frozen = True  # Phase 1: freeze backbone
 
         # Phase 1: train classifier only (backbone frozen)
