@@ -54,41 +54,68 @@ class FaceNetFeatureExtractor(nn.Module):
 
 
 class ArcFaceR50FeatureExtractor(nn.Module):
-    """ResNet-50 backbone with ArcFace pretrained weights.
+    """InsightFace ArcFace R50 (MS1MV2) via onnx2torch.
 
-    Uses insightface's ResNet-50 trained on MS1MV2 (5.8M images, 85K identities)
-    with Additive Angular Margin loss. Only layer1-4 weights are loaded (conv1/bn1
-    remain ImageNet-initialized due to architecture difference: 3x3 vs 7x7 first conv).
+    Loads the full insightface w600k_r50.onnx model as a PyTorch Module
+    using onnx2torch, preserving the complete computation graph for
+    fine-tuning. Input: (B, 3, 112, 112) in [-1, 1] (insightface convention).
 
-    Output: 2048-dim features.
+    Handles the preprocessing conversion from ImageNet normalization
+    (applied by the dataset pipeline) to insightface format internally:
+        1. Denormalize from ImageNet stats → [0, 1]
+        2. Reverse channel order (RGB → BGR)
+        3. Normalize to [-1, 1]
+
+    Output: 512-dim face embedding.
     """
 
     def __init__(self, pretrained=True, weights_path=None, **kwargs):
         super().__init__()
-        resnet = models.resnet50(weights=None)
+        try:
+            from onnx2torch import convert
+        except ImportError:
+            raise ImportError(
+                "onnx2torch is required for ArcFace pretrained features.\n"
+                "Install: pip install onnx2torch"
+            )
 
         if pretrained:
             if not weights_path or not os.path.exists(weights_path):
                 raise FileNotFoundError(
-                    f"ArcFace weights not found at: {weights_path}\n"
+                    f"ArcFace ONNX model not found at: {weights_path}\n"
                     f"Run: python download_arcface.py"
                 )
-            state_dict = torch.load(weights_path, map_location="cpu")
-            # Only load compatible layers (layer1-4), skip conv1/bn1 (different arch)
-            compatible = {k: v for k, v in state_dict.items()
-                         if k.startswith("layer") or k.startswith("downsample")}
-            missing, unexpected = resnet.load_state_dict(compatible, strict=False)
-            loaded = len(compatible)
-            skipped = [k for k in missing if not k.startswith("fc.")]
-            print(f"  Loaded ArcFace R50: {loaded} layers from {weights_path}")
-            if skipped:
-                print(f"  Kept ImageNet init: conv1, bn1 ({len(skipped)} params)")
+            self.backbone = convert(weights_path)
+            print(f"  Loaded ArcFace R50 via onnx2torch: {weights_path}")
+        else:
+            raise ValueError(
+                "ArcFace R50 requires pretrained weights (no random init available)."
+            )
 
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        self.feature_dim = 2048
+        self.feature_dim = 512
+
+        # Enable gradient checkpointing to reduce VRAM usage during fine-tuning
+        if hasattr(self.backbone, 'gradient_checkpointing_enable'):
+            self.backbone.gradient_checkpointing_enable()
+
+        # Register normalization constants as buffers (move with .to(device))
+        # Conversion: ImageNet-normalized → [0,1] → BGR → insightface [-1,1]
+        self.register_buffer('img_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('img_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x):
-        return self.backbone(x).flatten(1)
+        # x is ImageNet-normalized: (B, 3, H, W)
+        # 1. Denormalize to [0, 1]
+        x = x * self.img_std + self.img_mean
+        # 2. Resize to 112x112 (insightface input size)
+        if x.shape[2] != 112 or x.shape[3] != 112:
+            x = torch.nn.functional.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
+        # 3. RGB → BGR
+        x = x[:, [2, 1, 0], :, :]
+        # 4. Normalize to [-1, 1]
+        x = x * 2.0 - 1.0
+        # 5. Forward through insightface model → (B, 512)
+        return self.backbone(x)
 
 
 # ─── Backbone Registry ──────────────────────────────────────────────────────
@@ -111,7 +138,7 @@ class PainRecognitionModel(nn.Module):
     Supports three backbone options:
         - "imagenet": ResNet-18 (ImageNet) → 512-dim
         - "vggface2": InceptionResnetV1 (VGGFace2) → 512-dim
-        - "arcface":  ResNet-50 (ArcFace/MS1MV2) → 2048-dim
+        - "arcface":  InsightFace R50 (ArcFace/MS1MV2) → 512-dim
 
     Input:  (B, T, C, H, W) — batch of T-frame image sequences
     Output: (B, num_classes) — logits

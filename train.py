@@ -459,7 +459,7 @@ def train_and_evaluate(config, resume=False):
         # Resolve weights path for external pretrained models
         weights_path = None
         if config.pretrained_source == "arcface":
-            weights_path = os.path.join(config.pretrained_weights_path, "arcface_r50_backbone.pth")
+            weights_path = os.path.join(config.pretrained_weights_path, "w600k_r50.onnx")
         elif config.pretrained_source == "vggface2":
             weights_path = os.path.join(config.pretrained_weights_path, "resnet18_vggface2.pth")
 
@@ -539,6 +539,22 @@ def train_and_evaluate(config, resume=False):
         phase1_best_state = best_model_state
         print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
         model.unfreeze_backbone()
+
+        # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen
+        if config.pretrained_source == "arcface" and config.batch_size > 32:
+            phase2_batch_size = max(16, config.batch_size // 3)
+            print(f"  Reducing batch size for ArcFace fine-tuning: {config.batch_size} → {phase2_batch_size}")
+            train_loader = DataLoader(
+                train_dataset, batch_size=phase2_batch_size, shuffle=True,
+                num_workers=config.num_workers, pin_memory=True,
+                persistent_workers=True if config.num_workers > 0 else False,
+            )
+            test_loader = DataLoader(
+                test_dataset, batch_size=phase2_batch_size, shuffle=False,
+                num_workers=config.num_workers, pin_memory=True,
+                persistent_workers=True if config.num_workers > 0 else False,
+            )
+            torch.cuda.empty_cache()
         param_groups = model.get_param_groups(
             backbone_lr=0.0,  # Start at 0, warmup will increase
             classifier_lr=config.phase2_classifier_lr,

@@ -8,3 +8,5 @@ matplotlib>=3.5.0
 tqdm>=4.62.0
 pillow>=8.0.0
 pyyaml>=6.0
+onnx2torch>=1.5.0
+onnx>=1.12.0
