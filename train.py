@@ -12,6 +12,11 @@ Metrics:
     - Confusion matrix
     - Cohen's Kappa
     - Multi-class AUROC
+
+Loss functions:
+    - CrossEntropyLoss (standard, with optional class weights)
+    - Corn Ordinal Regression Loss (respects ordered pain levels)
+    - Focal Loss (focuses on hard examples)
 """
 
 import os
@@ -21,6 +26,7 @@ from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import (
@@ -40,6 +46,151 @@ from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, lo
 
 # GPU optimization
 torch.backends.cudnn.benchmark = True  # 加速固定输入尺寸的卷积
+
+
+# ─── Loss Functions ───────────────────────────────────────────────────────────
+
+class CornLoss(nn.Module):
+    """Conditional Ordinal Regression for Neural networks (Corn) Loss.
+
+    Converts a K-class ordinal classification problem into K-1 binary
+    classification tasks: "is label > k?" for k = 0, 1, ..., K-2.
+
+    This respects the natural ordering of pain levels (0 < 1 < 2 < 3 < 4),
+    penalizing larger ordinal errors more heavily than adjacent-class confusion.
+    """
+
+    def __init__(self, num_classes, class_weights=None):
+        """
+        Args:
+            num_classes: number of ordinal classes (e.g., 5 for pain levels 0-4)
+            class_weights: optional tensor of shape (num_classes,) with per-class
+                           weights (applied per-task via cumulative distribution)
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_tasks = num_classes - 1  # K-1 binary tasks
+        if class_weights is not None:
+            # Convert per-class weights to per-task weights
+            # Task k asks "label > k?", so its weight is based on the cumulative
+            # proportion of classes > k vs <= k
+            task_weights = []
+            for k in range(self.num_tasks):
+                w_gt = class_weights[k+1:].mean()   # classes > k
+                w_le = class_weights[:k+1].mean()    # classes <= k
+                task_weights.append((w_gt + w_le) / 2)
+            self.task_weights = torch.stack(task_weights)
+        else:
+            self.task_weights = None
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (B, K-1) — raw logits for each binary task
+            targets: (B,) — integer class labels in [0, K-1]
+
+        Returns:
+            scalar loss
+        """
+        # Build binary targets: (B, K-1)
+        # target[k] = 1 if true_label > k else 0
+        binary_targets = torch.stack(
+            [(targets > k).float() for k in range(self.num_tasks)], dim=1
+        ).to(logits.device)
+
+        # BCEWithLogitsLoss per task
+        losses = []
+        for k in range(self.num_tasks):
+            loss_k = F.binary_cross_entropy_with_logits(
+                logits[:, k], binary_targets[:, k], reduction="none"
+            )
+            if self.task_weights is not None:
+                loss_k = loss_k * self.task_weights[k].to(logits.device)
+            losses.append(loss_k)
+
+        return torch.stack(losses, dim=1).sum(dim=1).mean()
+
+
+def corn_logits_to_probs(logits):
+    """Convert Corn K-1 logits to K-class probability distribution.
+
+    Uses the cumulative chain rule:
+        P(y=0)   = 1 - σ(z_0)
+        P(y=k)   = σ(z_{k-1}) - σ(z_k)   for 0 < k < K-1
+        P(y=K-1) = σ(z_{K-2})
+    """
+    probs_k_minus_1 = torch.sigmoid(logits)  # (B, K-1)
+    # Build K-class probabilities
+    probs = []
+    K_minus_1 = logits.shape[1]
+    for k in range(K_minus_1 + 1):
+        if k == 0:
+            p = 1 - probs_k_minus_1[:, 0]
+        elif k == K_minus_1:
+            p = probs_k_minus_1[:, k - 1]
+        else:
+            p = probs_k_minus_1[:, k - 1] - probs_k_minus_1[:, k]
+        probs.append(p)
+    return torch.stack(probs, dim=1)  # (B, K)
+
+
+def corn_logits_to_preds(logits):
+    """Convert Corn K-1 logits to class predictions via argmax of derived probs."""
+    probs = corn_logits_to_probs(logits)
+    return probs.argmax(dim=1)
+
+
+class FocalLoss(nn.Module):
+    """Multi-class Focal Loss.
+
+    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+
+    Down-weights easy examples, forcing the model to focus on hard cases
+    (e.g., adjacent pain level confusion).
+    """
+
+    def __init__(self, alpha=None, gamma=2.0):
+        """
+        Args:
+            alpha: optional (num_classes,) class weights tensor
+            gamma: focusing parameter (higher = more focus on hard examples)
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (B, K) — raw logits
+            targets: (B,) — integer class labels
+
+        Returns:
+            scalar loss
+        """
+        ce_loss = F.cross_entropy(logits, targets, reduction="none", weight=self.alpha)
+        p_t = torch.exp(-ce_loss)  # predicted probability of true class
+        focal_loss = (1 - p_t) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+def build_loss(config, class_weights=None):
+    """Build loss function based on config.
+
+    Args:
+        config: Config object
+        class_weights: optional (num_classes,) tensor for CE/Focal loss weighting
+
+    Returns:
+        nn.Module loss function, and a bool `corn_mode` flag
+    """
+    if config.loss_type == "corn":
+        return CornLoss(config.num_classes, class_weights), True
+    elif config.loss_type == "focal":
+        alpha = class_weights if config.focal_alpha is None else config.focal_alpha
+        return FocalLoss(alpha=alpha, gamma=config.focal_gamma), False
+    else:  # "ce" or default
+        return nn.CrossEntropyLoss(weight=class_weights), False
 
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
@@ -204,7 +355,7 @@ def generate_windows(sweeps, window_size=5, slide_step=2):
 
 # ─── Training ────────────────────────────────────────────────────────────────
 
-def train_epoch(model, dataloader, optimizer, criterion, device, scaler):
+def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mode=False):
     """Train one epoch."""
     model.train()
     total_loss = 0
@@ -223,13 +374,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler):
         scaler.update()
 
         total_loss += loss.item()
-        preds.extend(logits.argmax(dim=1).cpu().numpy())
+        if corn_mode:
+            preds.extend(corn_logits_to_preds(logits).cpu().numpy())
+        else:
+            preds.extend(logits.argmax(dim=1).cpu().numpy())
         labels.extend(targets.cpu().numpy())
 
     return total_loss / len(dataloader), preds, labels
 
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, corn_mode=False):
     """Evaluate model, return loss, predictions, labels, and probabilities."""
     model.eval()
     total_loss = 0
@@ -245,8 +399,12 @@ def evaluate(model, dataloader, criterion, device):
                 loss = criterion(logits, targets)
 
             total_loss += loss.item()
-            probs.extend(torch.softmax(logits, dim=1).cpu().numpy())
-            preds.extend(logits.argmax(dim=1).cpu().numpy())
+            if corn_mode:
+                probs.extend(corn_logits_to_probs(logits).cpu().numpy())
+                preds.extend(corn_logits_to_preds(logits).cpu().numpy())
+            else:
+                probs.extend(torch.softmax(logits, dim=1).cpu().numpy())
+                preds.extend(logits.argmax(dim=1).cpu().numpy())
             labels.extend(targets.cpu().numpy())
 
     return total_loss / len(dataloader), np.array(preds), np.array(labels), np.array(probs)
@@ -456,13 +614,18 @@ def train_and_evaluate(config, resume=False):
         )
 
         # Create model
-        # Resolve weights path for external pretrained models
+        # Resolve weights path for external pretrained models.
+        # VGGFace2 loads weights internally via facenet-pytorch (InceptionResnetV1),
+        # so no external weights_path is needed.
         weights_path = None
         if config.pretrained_source == "arcface":
             weights_path = os.path.join(config.pretrained_weights_path, "w600k_r50.onnx")
-        elif config.pretrained_source == "vggface2":
-            weights_path = os.path.join(config.pretrained_weights_path, "resnet18_vggface2.pth")
 
+        # Build loss function (supports CE, Corn ordinal, Focal)
+        criterion, corn_mode = build_loss(config, class_weights)
+        print(f"  Loss: {config.loss_type}" + (" (corn ordinal)" if corn_mode else ""))
+
+        # Create model (Corn mode outputs K-1 logits for K-class ordinal regression)
         model = PainRecognitionModel(
             num_classes=config.num_classes,
             pretrained=config.pretrained,
@@ -471,9 +634,10 @@ def train_and_evaluate(config, resume=False):
             lstm_hidden_dim=config.lstm_hidden_dim,
             lstm_num_layers=config.lstm_num_layers,
             dropout=config.dropout,
+            corn_mode=corn_mode,
+            use_attention_pooling=config.use_attention_pooling,
         ).to(device)
 
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
         scaler = GradScaler()
 
         best_val_loss = float("inf")
@@ -511,10 +675,10 @@ def train_and_evaluate(config, resume=False):
 
         for epoch in range(phase1_start, phase1_end):
             train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler,
+                model, train_loader, optimizer, criterion, device, scaler, corn_mode,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, test_loader, criterion, device,
+                model, test_loader, criterion, device, corn_mode,
             )
             scheduler.step(val_loss)
 
@@ -590,10 +754,10 @@ def train_and_evaluate(config, resume=False):
                           f"over {config.warmup_epochs} epochs")
 
             train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler,
+                model, train_loader, optimizer, criterion, device, scaler, corn_mode,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, test_loader, criterion, device,
+                model, test_loader, criterion, device, corn_mode,
             )
             scheduler.step(val_loss)
 
@@ -630,7 +794,7 @@ def train_and_evaluate(config, resume=False):
         model.to(device)
 
         _, fold_preds, fold_labels, fold_probs = evaluate(
-            model, test_loader, criterion, device,
+            model, test_loader, criterion, device, corn_mode,
         )
 
         # Collect predictions

@@ -25,7 +25,8 @@ class Config:
 
         # Model
         self.num_classes = 5
-        self.sequence_length = 5
+        self.sequence_length = 12  # longer temporal window (~400ms)
+        self.slide_step = 1  # max overlap for more training samples
         self.backbone = "resnet18"
         self.pretrained = True
         self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface"
@@ -45,16 +46,21 @@ class Config:
         # Training (optimized for RTX 3080 10.5GB)
         self.batch_size = 96
         self.patience = 7
-        self.slide_step = 2  # 滑动窗口步长 (1=最大重叠, 2=推荐, 5=无重叠)
         self.lstm_hidden_dim = 256
         self.lstm_num_layers = 1
         self.dropout = 0.5
+        self.use_attention_pooling = False  # learnable temporal attention over LSTM outputs
 
         # Data & Class Imbalance
         self.num_workers = 8
         self.undersample = True        # 欠采样多数类
         self.class_weight = "inverse"  # "none" | "inverse" | "sqrt_inverse"
         self.num_folds = 0  # 0 = all folds
+
+        # Loss function
+        self.loss_type = "ce"  # "ce" | "corn" | "focal"
+        self.focal_gamma = 2.0  # gamma for focal loss (higher = more focus on hard examples)
+        self.focal_alpha = None  # None = auto-compute from class distribution
 
         # Task mode
         self.binary_mode = False  # True: 有痛(1) vs 无痛(0), False: 5类疼痛等级

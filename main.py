@@ -17,6 +17,12 @@ def main():
     parser.add_argument("--binary", action="store_true", help="Binary mode: pain (1) vs no-pain (0)")
     parser.add_argument("--vggface2", action="store_true", help="Use VGGFace2 pretrained weights (facenet-pytorch)")
     parser.add_argument("--arcface", action="store_true", help="Use ArcFace pretrained weights (insightface R50)")
+    parser.add_argument("--loss", type=str, default=None, choices=["ce", "corn", "focal"],
+                        help="Loss function: ce (default), corn (ordinal regression), focal")
+    parser.add_argument("--focal_gamma", type=float, default=None,
+                        help="Focal loss gamma (higher = more focus on hard examples)")
+    parser.add_argument("--attention", action="store_true",
+                        help="Use temporal attention pooling over LSTM outputs")
     args = parser.parse_args()
 
     # Set env var before creating Config
@@ -36,6 +42,13 @@ def main():
     if args.binary:
         config.binary_mode = True
         config.num_classes = 2
+
+    if args.loss:
+        config.loss_type = args.loss
+    if args.focal_gamma is not None:
+        config.focal_gamma = args.focal_gamma
+    if args.attention:
+        config.use_attention_pooling = True
 
     if args.resume:
         print("Resume mode enabled")

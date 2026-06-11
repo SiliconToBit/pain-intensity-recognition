@@ -23,8 +23,9 @@ class ResNet18FeatureExtractor(nn.Module):
 class FaceNetFeatureExtractor(nn.Module):
     """InceptionResnetV1 pretrained on VGGFace2 (via facenet-pytorch).
 
-    512-dim face embedding, trained on 3.3M face images.
-    Input renormalized from ImageNet stats to [-1, 1] in forward pass.
+    512-dim face embedding, trained on 3.3M face images at 160x160.
+    Input renormalized from ImageNet stats → resize to 160x160 → [-1, 1].
+    Weights are auto-downloaded by facenet-pytorch on first use (~100 MB).
     """
 
     def __init__(self, pretrained=True, **kwargs):
@@ -47,8 +48,12 @@ class FaceNetFeatureExtractor(nn.Module):
         self.register_buffer('img_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x):
-        # Renormalize: ImageNet → [0,1] → VGGFace2 [-1,1]
+        # Renormalize: ImageNet → [0,1]
         x = x * self.img_std + self.img_mean
+        # Resize to 160x160 (native InceptionResnetV1 input size)
+        if x.shape[2] != 160 or x.shape[3] != 160:
+            x = torch.nn.functional.interpolate(x, size=(160, 160), mode='bilinear', align_corners=False)
+        # Normalize to [-1, 1] for VGGFace2
         x = x * 2.0 - 1.0
         return self.backbone(x)
 
@@ -132,6 +137,32 @@ BACKBONE_BUILDERS = {
 
 # ─── Main Model ─────────────────────────────────────────────────────────────
 
+class TemporalAttentionPooling(nn.Module):
+    """Learnable temporal attention pooling over LSTM output sequence.
+
+    Computes softmax-weighted sum of all timestep outputs, allowing the model
+    to focus on the most discriminative frames (e.g., peak pain expressions)
+    rather than treating all frames equally.
+
+    Input:  (B, T, D) — LSTM output sequence
+    Output: (B, D)   — attention-pooled feature vector
+    """
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, lstm_out):
+        # lstm_out: (B, T, D)
+        weights = self.attention(lstm_out).squeeze(-1)  # (B, T)
+        weights = torch.softmax(weights, dim=1)          # (B, T)
+        return (lstm_out * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
+
+
 class PainRecognitionModel(nn.Module):
     """Pain intensity recognition: Backbone + LSTM + Classifier.
 
@@ -153,6 +184,8 @@ class PainRecognitionModel(nn.Module):
         lstm_hidden_dim=256,
         lstm_num_layers=1,
         dropout=0.5,
+        corn_mode=False,
+        use_attention_pooling=False,
     ):
         super().__init__()
 
@@ -173,9 +206,17 @@ class PainRecognitionModel(nn.Module):
             dropout=dropout if lstm_num_layers > 1 else 0.0,
         )
 
+        # Temporal pooling: attention-weighted or simple mean
+        self.use_attention_pooling = use_attention_pooling
+        if use_attention_pooling:
+            self.attention_pool = TemporalAttentionPooling(lstm_hidden_dim)
+
+        # Corn ordinal regression: output K-1 logits for K classes
+        self.corn_mode = corn_mode
+        output_dim = num_classes - 1 if corn_mode else num_classes
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden_dim, num_classes),
+            nn.Linear(lstm_hidden_dim, output_dim),
         )
 
     def freeze_backbone(self):
@@ -196,6 +237,8 @@ class PainRecognitionModel(nn.Module):
         """
         backbone_params = list(self.feature_extractor.parameters())
         classifier_params = list(self.lstm.parameters()) + list(self.classifier.parameters())
+        if self.use_attention_pooling:
+            classifier_params += list(self.attention_pool.parameters())
         return [
             {"params": backbone_params, "lr": backbone_lr, "is_backbone": True},
             {"params": classifier_params, "lr": classifier_lr, "is_backbone": False},
@@ -224,8 +267,11 @@ class PainRecognitionModel(nn.Module):
         # LSTM: (B, T, hidden_dim)
         lstm_out, _ = self.lstm(features)
 
-        # Use last timestep output: (B, hidden_dim)
-        last_out = lstm_out[:, -1, :]
+        # Temporal pooling: attention-weighted or simple mean
+        if self.use_attention_pooling:
+            last_out = self.attention_pool(lstm_out)
+        else:
+            last_out = lstm_out.mean(dim=1)
 
         # Classify: (B, num_classes)
         logits = self.classifier(last_out)

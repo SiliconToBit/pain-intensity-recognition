@@ -10,3 +10,4 @@ pillow>=8.0.0
 pyyaml>=6.0
 onnx2torch>=1.5.0
 onnx>=1.12.0
+facenet-pytorch>=2.5.0

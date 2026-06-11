@@ -1,5 +1,17 @@
 """Download VGGFace2 pretrained ResNet-18 weights.
 
+NOTE: This script downloads a VGGFace2-fine-tuned **ResNet-18** model.
+The current project uses `facenet_pytorch.InceptionResnetV1` for VGGFace2
+(via `--vggface2` CLI flag), which auto-downloads its own weights internally.
+
+This script is kept for reference / future use as an alternative backbone option.
+To use the InceptionResnetV1 VGGFace2 model (recommended):
+    pip install facenet-pytorch
+    python main.py --vggface2
+
+To use this ResNet-18 VGGFace2 model instead, you would need to add a new
+backbone class in model.py that loads this .pth file.
+
 Usage:
     python download_vggface2.py
 
