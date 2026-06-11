@@ -267,11 +267,11 @@ class PainRecognitionModel(nn.Module):
         # LSTM: (B, T, hidden_dim)
         lstm_out, _ = self.lstm(features)
 
-        # Temporal pooling: attention-weighted or simple mean
+        # Temporal pooling: attention-weighted or last-timestep
         if self.use_attention_pooling:
             last_out = self.attention_pool(lstm_out)
         else:
-            last_out = lstm_out.mean(dim=1)
+            last_out = lstm_out[:, -1, :]  # use final LSTM timestep
 
         # Classify: (B, num_classes)
         logits = self.classifier(last_out)
