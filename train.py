@@ -640,7 +640,7 @@ def train_and_evaluate(config, resume=False):
 
         scaler = GradScaler()
 
-        best_val_loss = float("inf")
+        best_val_loss = 0.0  # tracks val F1 (higher is better)
         best_model_state = None
         patience_counter = 0
         start_epoch = 0
@@ -651,9 +651,9 @@ def train_and_evaluate(config, resume=False):
             if ckpt is not None:
                 try:
                     model.load_state_dict(ckpt["model_state_dict"])
-                    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+                    best_val_loss = ckpt.get("best_val_loss", 0.0)
                     patience_counter = ckpt.get("patience_counter", 0)
-                    print(f"  Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+                    print(f"  Resumed from epoch {start_epoch}, best_val_f1={best_val_loss:.4f}")
                 except (RuntimeError, KeyError) as e:
                     print(f"  Checkpoint incompatible (different architecture), starting fresh: {e}")
                     ckpt = None
@@ -682,10 +682,11 @@ def train_and_evaluate(config, resume=False):
             )
             scheduler.step(val_loss)
 
+            val_f1 = f1_score(val_labels, val_preds, average="weighted")
             train_f1 = f1_score(train_labels, train_preds, average="weighted")
             print(f"  Epoch {epoch+1}/{phase1_end} | "
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Train F1: {train_f1:.4f}")
+                  f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
 
             # Save checkpoint
             save_checkpoint(
@@ -693,8 +694,8 @@ def train_and_evaluate(config, resume=False):
                 best_val_loss, patience_counter,
             )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_f1 > best_val_loss:  # track best val F1 (higher is better)
+                best_val_loss = val_f1
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -734,7 +735,7 @@ def train_and_evaluate(config, resume=False):
         )
 
         # Reset early stopping state for Phase 2
-        best_val_loss = float("inf")
+        best_val_loss = 0.0  # reset val F1 tracking for phase 2
         patience_counter = 0
         best_model_state = None
         phase2_epochs = phase1_end + config.phase2_epochs
@@ -764,9 +765,11 @@ def train_and_evaluate(config, resume=False):
             # Print current backbone LR
             current_backbone_lr = optimizer.param_groups[0]["lr"]
             train_f1 = f1_score(train_labels, train_preds, average="weighted")
+            val_f1 = f1_score(val_labels, val_preds, average="weighted")
             print(f"  Epoch {epoch+1}/{phase2_epochs} | "
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Train F1: {train_f1:.4f} | Backbone LR: {current_backbone_lr:.2e}")
+                  f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
+                  f"Backbone LR: {current_backbone_lr:.2e}")
 
             # Save checkpoint
             save_checkpoint(
@@ -774,8 +777,8 @@ def train_and_evaluate(config, resume=False):
                 best_val_loss, patience_counter,
             )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_f1 > best_val_loss:  # track best val F1
+                best_val_loss = val_f1
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -787,7 +790,7 @@ def train_and_evaluate(config, resume=False):
         # Load best model: prefer Phase 2 best, fall back to Phase 1 best
         if best_model_state:
             model.load_state_dict(best_model_state)
-            print(f"  Using Phase 2 best model (val_loss={best_val_loss:.4f})")
+            print(f"  Using Phase 2 best model (val_f1={best_val_loss:.4f})")
         elif phase1_best_state:
             model.load_state_dict(phase1_best_state)
             print(f"  Phase 2 did not improve, using Phase 1 best model")
