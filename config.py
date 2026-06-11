@@ -68,7 +68,7 @@ class Config:
         # Data & Class Imbalance
         self.num_workers = num_workers
         self.undersample = True
-        self.class_weight = "inverse"
+        self.class_weight = "none"  # 欠采样已平衡，不需要额外加权
         self.num_folds = 0
 
         # Loss function
