@@ -25,8 +25,8 @@ class Config:
 
         # Model
         self.num_classes = 5
-        self.sequence_length = 12  # longer temporal window (~400ms)
-        self.slide_step = 1  # max overlap for more training samples
+        self.sequence_length = 5
+        self.slide_step = 2  # 滑动窗口步长 (1=最大重叠, 2=推荐, 5=无重叠)
         self.backbone = "resnet18"
         self.pretrained = True
         self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface"
