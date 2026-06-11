@@ -23,13 +23,21 @@ def main():
                         help="Focal loss gamma (higher = more focus on hard examples)")
     parser.add_argument("--attention", action="store_true",
                         help="Use temporal attention pooling over LSTM outputs")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size (auto-scaled to GPU VRAM if not set)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="DataLoader workers (auto-scaled to CPU cores if not set)")
     args = parser.parse_args()
 
     # Set env var before creating Config
     if args.data_root:
         os.environ["MINTPAIN_ROOT"] = args.data_root
 
-    config = Config(args.config)
+    config = Config(
+        args.config,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
 
     if args.vggface2:
         config.pretrained_source = "vggface2"
@@ -57,10 +65,9 @@ def main():
     pretrained_str = config.pretrained_source.upper() if config.pretrained else "None"
     print(f"Dataset: {config.preprocessed_dir}")
     print(f"Output:  {config.output_dir}")
-    print(f"Model:   {config.backbone} + LSTM")
-    print(f"Pretrained: {pretrained_str}")
-    print(f"Task:    {mode_str}")
-    print(f"LOSO folds: {config.num_folds or 'all'}")
+    print(f"Model:   {config.backbone} + LSTM  |  Pretrained: {pretrained_str}")
+    print(f"Task:    {mode_str}  |  LOSO folds: {config.num_folds or 'all'}")
+    print(config.gpu_summary())
 
     train_and_evaluate(config, resume=args.resume)
 

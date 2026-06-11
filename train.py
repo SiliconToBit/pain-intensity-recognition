@@ -511,14 +511,7 @@ def print_metrics(metrics, num_classes=5):
 def train_and_evaluate(config, resume=False):
     """Full LOSO cross-validation training and evaluation."""
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    if device.type == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-        print(f"Batch size: {config.batch_size} | Workers: {config.num_workers}")
-        print(f"cudnn.benchmark: {torch.backends.cudnn.benchmark}")
+    print(f"Using device: {device}  |  cudnn.benchmark: {torch.backends.cudnn.benchmark}")
 
     # Scan dataset directory
     print("Scanning dataset...")
