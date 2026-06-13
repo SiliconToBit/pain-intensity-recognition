@@ -95,6 +95,8 @@ python main.py --resume
 python main.py --config my_config.yaml
 ```
 
+SwanLab 实验记录说明见 [docs/swanlab.md](docs/swanlab.md)。
+
 ---
 
 ## 配置参数 (config.py)
