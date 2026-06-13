@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import swanlab
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import (
     f1_score,
@@ -541,6 +542,28 @@ def train_and_evaluate(config, resume=False):
 
     print(f"Using {num_folds} folds for LOSO cross-validation")
 
+    # ── Initialize SwanLab ──
+    run = swanlab.init(
+        project="pain-intensity-recognition",
+        experiment_name=f"ResNet18-LSTM_{config.loss_type}_{'binary' if config.binary_mode else '5class'}",
+        config={
+            "backbone": config.backbone,
+            "pretrained_source": config.pretrained_source,
+            "num_classes": config.num_classes,
+            "sequence_length": config.sequence_length,
+            "batch_size": config.batch_size,
+            "phase1_epochs": config.phase1_epochs,
+            "phase2_epochs": config.phase2_epochs,
+            "loss_type": config.loss_type,
+            "lstm_hidden_dim": config.lstm_hidden_dim,
+            "dropout": config.dropout,
+            "use_attention": config.use_attention_pooling,
+            "binary_mode": config.binary_mode,
+            "undersample": config.undersample,
+            "num_folds": config.num_folds or len(fold_names),
+        },
+    )
+
     # Collect all predictions across folds
     all_preds = []
     all_labels = []
@@ -681,6 +704,14 @@ def train_and_evaluate(config, resume=False):
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
 
+            # Log to SwanLab
+            swanlab.log({
+                f"fold_{fold_idx}/phase1/train_loss": train_loss,
+                f"fold_{fold_idx}/phase1/val_loss": val_loss,
+                f"fold_{fold_idx}/phase1/train_f1": train_f1,
+                f"fold_{fold_idx}/phase1/val_f1": val_f1,
+            }, step=epoch + 1)
+
             # Save checkpoint
             save_checkpoint(
                 config, fold_idx, epoch, model, optimizer, scheduler,
@@ -764,6 +795,15 @@ def train_and_evaluate(config, resume=False):
                   f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
                   f"Backbone LR: {current_backbone_lr:.2e}")
 
+            # Log to SwanLab
+            swanlab.log({
+                f"fold_{fold_idx}/phase2/train_loss": train_loss,
+                f"fold_{fold_idx}/phase2/val_loss": val_loss,
+                f"fold_{fold_idx}/phase2/train_f1": train_f1,
+                f"fold_{fold_idx}/phase2/val_f1": val_f1,
+                f"fold_{fold_idx}/phase2/backbone_lr": current_backbone_lr,
+            }, step=epoch + 1)
+
             # Save checkpoint
             save_checkpoint(
                 config, fold_idx, epoch, model, optimizer, scheduler,
@@ -802,6 +842,12 @@ def train_and_evaluate(config, resume=False):
         fold_f1 = f1_score(fold_labels, fold_preds, average="weighted")
         print(f"\n  {fold_name} ({test_subject}) | Weighted F1: {fold_f1:.4f}")
 
+        # Log fold result to SwanLab
+        swanlab.log({
+            f"fold_results/{fold_name}/weighted_f1": fold_f1,
+            f"fold_results/{fold_name}/test_subject": test_subject,
+        }, step=fold_idx + 1)
+
         # Save progress
         completed_folds.append(fold_name)
         save_progress(config, "train", completed_folds)
@@ -821,6 +867,34 @@ def train_and_evaluate(config, resume=False):
     # Classification report
     print(f"\nClassification Report:")
     print(classification_report(all_labels, all_preds, digits=4))
+
+    # ── Log final metrics to SwanLab ──
+    swanlab.log({
+        "final/weighted_f1": metrics["weighted_f1"],
+        "final/macro_f1": metrics["macro_f1"],
+        "final/cohens_kappa": metrics["cohens_kappa"],
+        "final/auroc_weighted": metrics["auroc_weighted"],
+    })
+
+    # Log confusion matrix as image
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        cm = np.array(metrics["confusion_matrix"])
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                    xticklabels=range(config.num_classes),
+                    yticklabels=range(config.num_classes))
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title("Confusion Matrix")
+        swanlab.log({"final/confusion_matrix": swanlab.Image(fig)})
+        plt.close(fig)
+    except ImportError:
+        print("  Skipping confusion matrix image: matplotlib/seaborn not available")
 
     # Save results
     results = {
@@ -855,3 +929,6 @@ def train_and_evaluate(config, resume=False):
     np.save(os.path.join(config.output_dir, "probabilities.npy"), all_probs)
     np.save(os.path.join(config.output_dir, "confusion_matrix.npy"),
             np.array(metrics["confusion_matrix"]))
+
+    # ── Finish SwanLab run ──
+    swanlab.finish()
