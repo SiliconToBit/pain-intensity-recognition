@@ -506,6 +506,20 @@ def train_and_evaluate(config, resume=False):
             "fold/test_subject_id": subject_num,
         }, step=fold_idx + 1)
 
+        # Per-fold echarts confusion matrix
+        fold_class_names = (
+            ["无痛 (No Pain)", "疼痛 (Pain)"] if config.binary_mode
+            else ["无痛 (0)", "轻微疼痛 (1)", "中度疼痛 (2)", "较强疼痛 (3)", "剧烈疼痛 (4)"]
+        )
+        try:
+            swanlab.log({
+                f"fold/confusion_matrix_{test_subject}": swanlab.echarts.confusion_matrix(
+                    fold_labels, fold_preds, fold_class_names
+                )
+            })
+        except Exception:
+            pass  # pyecharts may not be installed
+
         # Save progress
         completed_folds.append(fold_name)
         save_progress(config, "train", completed_folds)
@@ -541,7 +555,38 @@ def train_and_evaluate(config, resume=False):
         final_log[f"final/auc_class_{i}"] = a
     swanlab.log(final_log)
 
-    # Log confusion matrix as image
+    # ── SwanLab ECharts: Confusion Matrix ──
+    if config.binary_mode:
+        class_names = ["无痛 (No Pain)", "疼痛 (Pain)"]
+    else:
+        class_names = [
+            "无痛 (0)", "轻微疼痛 (1)", "中度疼痛 (2)", "较强疼痛 (3)", "剧烈疼痛 (4)"
+        ]
+    try:
+        swanlab.log({
+            "final/confusion_matrix_echarts": swanlab.echarts.confusion_matrix(
+                all_labels.tolist(), all_preds.tolist(), class_names
+            )
+        })
+    except Exception as e:
+        print(f"  Skipping echarts confusion matrix: {e}")
+
+    # ── SwanLab ECharts: ROC & PR Curves (binary mode) ──
+    if config.binary_mode:
+        try:
+            y_prob_pos = all_probs[:, 1]
+            swanlab.log({
+                "final/roc_curve": swanlab.echarts.roc_curve(
+                    all_labels.tolist(), y_prob_pos.tolist(), title="ROC Curve"
+                ),
+                "final/pr_curve": swanlab.echarts.pr_curve(
+                    all_labels.tolist(), y_prob_pos.tolist(), title="PR Curve"
+                ),
+            })
+        except Exception as e:
+            print(f"  Skipping echarts ROC/PR curves: {e}")
+
+    # Log confusion matrix as image (matplotlib fallback)
     try:
         import matplotlib
         matplotlib.use("Agg")
