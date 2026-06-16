@@ -1,357 +1,42 @@
-"""Training and evaluation for ResNet-18 pain intensity recognition.
+"""Training and evaluation for pain intensity recognition.
 
 Pipeline:
-    1. Load LOSO splits from pkl
+    1. Load LOSO splits from scanned dataset
     2. For each fold: generate frame windows → train model → collect predictions
     3. After all folds: compute comprehensive metrics on aggregated predictions
 
-Metrics:
-    - Weighted F1-score
-    - Macro F1-score
-    - Per-class recall
-    - Confusion matrix
-    - Cohen's Kappa
-    - Multi-class AUROC
-
-Loss functions:
-    - CrossEntropyLoss (standard, with optional class weights)
-    - Corn Ordinal Regression Loss (respects ordered pain levels)
-    - Focal Loss (focuses on hard examples)
+Supports two-phase training:
+    - Phase 1: backbone frozen, train classifier only
+    - Phase 2: unfreeze backbone with lower LR + warmup
 """
 
 import os
-import re
 import json
 from collections import Counter
+
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import swanlab
 from torch.cuda.amp import autocast, GradScaler
-from sklearn.metrics import (
-    f1_score,
-    recall_score,
-    confusion_matrix,
-    cohen_kappa_score,
-    roc_auc_score,
-    classification_report,
-)
-from sklearn.preprocessing import label_binarize
+from sklearn.metrics import f1_score, classification_report
 from tqdm import tqdm
+import swanlab
 
 from model import PainRecognitionModel
-from utils.dataset import FrameSequenceDataset, get_train_transforms, get_test_transforms, undersample_windows, compute_class_weights
+from utils.dataset import (
+    FrameSequenceDataset,
+    get_train_transforms,
+    get_test_transforms,
+    undersample_windows,
+    compute_class_weights,
+)
 from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, load_progress
+from utils.losses import build_loss, corn_logits_to_preds, corn_logits_to_probs
+from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows
+from utils.metrics import compute_metrics, print_metrics
 
 # GPU optimization
 torch.backends.cudnn.benchmark = True  # 加速固定输入尺寸的卷积
-
-
-# ─── Loss Functions ───────────────────────────────────────────────────────────
-
-class CornLoss(nn.Module):
-    """Conditional Ordinal Regression for Neural networks (Corn) Loss.
-
-    Converts a K-class ordinal classification problem into K-1 binary
-    classification tasks: "is label > k?" for k = 0, 1, ..., K-2.
-
-    This respects the natural ordering of pain levels (0 < 1 < 2 < 3 < 4),
-    penalizing larger ordinal errors more heavily than adjacent-class confusion.
-    """
-
-    def __init__(self, num_classes, class_weights=None):
-        """
-        Args:
-            num_classes: number of ordinal classes (e.g., 5 for pain levels 0-4)
-            class_weights: optional tensor of shape (num_classes,) with per-class
-                           weights (applied per-task via cumulative distribution)
-        """
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_tasks = num_classes - 1  # K-1 binary tasks
-        if class_weights is not None:
-            # Convert per-class weights to per-task weights
-            # Task k asks "label > k?", so its weight is based on the cumulative
-            # proportion of classes > k vs <= k
-            task_weights = []
-            for k in range(self.num_tasks):
-                w_gt = class_weights[k+1:].mean()   # classes > k
-                w_le = class_weights[:k+1].mean()    # classes <= k
-                task_weights.append((w_gt + w_le) / 2)
-            self.task_weights = torch.stack(task_weights)
-        else:
-            self.task_weights = None
-
-    def forward(self, logits, targets):
-        """
-        Args:
-            logits: (B, K-1) — raw logits for each binary task
-            targets: (B,) — integer class labels in [0, K-1]
-
-        Returns:
-            scalar loss
-        """
-        # Build binary targets: (B, K-1)
-        # target[k] = 1 if true_label > k else 0
-        binary_targets = torch.stack(
-            [(targets > k).float() for k in range(self.num_tasks)], dim=1
-        ).to(logits.device)
-
-        # BCEWithLogitsLoss per task
-        losses = []
-        for k in range(self.num_tasks):
-            loss_k = F.binary_cross_entropy_with_logits(
-                logits[:, k], binary_targets[:, k], reduction="none"
-            )
-            if self.task_weights is not None:
-                loss_k = loss_k * self.task_weights[k].to(logits.device)
-            losses.append(loss_k)
-
-        return torch.stack(losses, dim=1).sum(dim=1).mean()
-
-
-def corn_logits_to_probs(logits):
-    """Convert Corn K-1 logits to K-class probability distribution.
-
-    Uses the cumulative chain rule:
-        P(y=0)   = 1 - σ(z_0)
-        P(y=k)   = σ(z_{k-1}) - σ(z_k)   for 0 < k < K-1
-        P(y=K-1) = σ(z_{K-2})
-    """
-    probs_k_minus_1 = torch.sigmoid(logits)  # (B, K-1)
-    # Build K-class probabilities
-    probs = []
-    K_minus_1 = logits.shape[1]
-    for k in range(K_minus_1 + 1):
-        if k == 0:
-            p = 1 - probs_k_minus_1[:, 0]
-        elif k == K_minus_1:
-            p = probs_k_minus_1[:, k - 1]
-        else:
-            p = probs_k_minus_1[:, k - 1] - probs_k_minus_1[:, k]
-        probs.append(p)
-    return torch.stack(probs, dim=1)  # (B, K)
-
-
-def corn_logits_to_preds(logits):
-    """Convert Corn K-1 logits to class predictions via argmax of derived probs."""
-    probs = corn_logits_to_probs(logits)
-    return probs.argmax(dim=1)
-
-
-class FocalLoss(nn.Module):
-    """Multi-class Focal Loss.
-
-    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-
-    Down-weights easy examples, forcing the model to focus on hard cases
-    (e.g., adjacent pain level confusion).
-    """
-
-    def __init__(self, alpha=None, gamma=2.0):
-        """
-        Args:
-            alpha: optional (num_classes,) class weights tensor
-            gamma: focusing parameter (higher = more focus on hard examples)
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, logits, targets):
-        """
-        Args:
-            logits: (B, K) — raw logits
-            targets: (B,) — integer class labels
-
-        Returns:
-            scalar loss
-        """
-        ce_loss = F.cross_entropy(logits, targets, reduction="none", weight=self.alpha)
-        p_t = torch.exp(-ce_loss)  # predicted probability of true class
-        focal_loss = (1 - p_t) ** self.gamma * ce_loss
-        return focal_loss.mean()
-
-
-def build_loss(config, class_weights=None):
-    """Build loss function based on config.
-
-    Args:
-        config: Config object
-        class_weights: optional (num_classes,) tensor for CE/Focal loss weighting
-
-    Returns:
-        nn.Module loss function, and a bool `corn_mode` flag
-    """
-    if config.loss_type == "corn":
-        return CornLoss(config.num_classes, class_weights), True
-    elif config.loss_type == "focal":
-        alpha = class_weights if config.focal_alpha is None else config.focal_alpha
-        return FocalLoss(alpha=alpha, gamma=config.focal_gamma), False
-    else:  # "ce" or default
-        return nn.CrossEntropyLoss(weight=class_weights), False
-
-
-# ─── Data Loading ────────────────────────────────────────────────────────────
-
-FRAME_PATTERN = re.compile(r"RGB-(\d+)-(\d+)-(\d+)-(\d+)\.\w+")
-
-
-def parse_frame_timestamp(filename):
-    m = FRAME_PATTERN.match(os.path.basename(filename))
-    if m:
-        h, mi, s, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-        return h * 3600000 + mi * 60000 + s * 1000 + ms
-    return 0
-
-
-def scan_dataset(config):
-    """Scan directory structure to build sweep list.
-
-    Directory structure:
-        preprocessed_dir/
-        ├── Sub1 Daniel Simonsen/
-        │   ├── Annotated_data_Sub01_Trial01/
-        │   │   ├── Sub01_Trial01_Sweep01_Label0/rgb/*.jpg
-        │   │   ├── Sub01_Trial01_Sweep01_Label3/rgb/*.jpg
-        │   │   └── ...
-        │   └── Annotated_data_Sub01_Trial02/
-        └── ...
-
-    Returns:
-        list of dicts: [{subject, subject_id, sweep_id, trial, label, frame_paths}, ...]
-    """
-    base = config.preprocessed_dir
-    sweeps = []
-
-    for sub_name in sorted(os.listdir(base)):
-        sub_path = os.path.join(base, sub_name)
-        if not os.path.isdir(sub_path) or sub_name.startswith("."):
-            continue
-
-        # Extract subject ID: "Sub1 Daniel Simonsen" → "Sub01"
-        sub_num = int(sub_name.split()[0].replace("Sub", ""))
-        subject_id = f"Sub{sub_num:02d}"
-
-        for trial_name in sorted(os.listdir(sub_path)):
-            trial_path = os.path.join(sub_path, trial_name)
-            if not os.path.isdir(trial_path):
-                continue
-
-            for sweep_name in sorted(os.listdir(trial_path)):
-                sweep_path = os.path.join(trial_path, sweep_name)
-                if not os.path.isdir(sweep_path):
-                    continue
-
-                # Extract label from dir name: "Sub01_Trial01_Sweep01_Label0" → 0
-                label = None
-                for part in sweep_name.split("_"):
-                    if part.startswith("Label"):
-                        label = int(part.replace("Label", ""))
-                        break
-                if label is None:
-                    continue
-
-                # Get frame paths
-                rgb_dir = os.path.join(sweep_path, "rgb")
-                if not os.path.isdir(rgb_dir):
-                    continue
-                frame_paths = sorted([
-                    os.path.join(rgb_dir, f)
-                    for f in os.listdir(rgb_dir)
-                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
-                ], key=lambda x: parse_frame_timestamp(os.path.basename(x)))
-
-                if len(frame_paths) == 0:
-                    continue
-
-                # Extract sweep_id: "Sub01_Trial01_Sweep01" from dir name
-                sweep_id = "_".join(sweep_name.split("_")[:3])
-                trial = trial_name.split("/")[-1]
-
-                sweeps.append({
-                    "subject": sub_name,
-                    "subject_id": subject_id,
-                    "sweep_id": sweep_id,
-                    "trial": trial,
-                    "label": label,
-                    "frame_paths": frame_paths,
-                })
-
-    return sweeps
-
-
-def remap_to_binary(sweeps):
-    """Remap 5-class labels to binary: 0=no-pain, 1=pain.
-
-    Label 0 (无痛) → 0
-    Label 1-4 (有痛) → 1
-    """
-    for s in sweeps:
-        s["label"] = 0 if s["label"] == 0 else 1
-    return sweeps
-
-
-def build_loso_folds(sweeps):
-    """Build Leave-One-Subject-Out folds from sweep list.
-
-    Returns:
-        dict: {fold_name: {"test_subject": str, "train_sweeps": [...], "test_sweeps": [...]}}
-    """
-    # Group sweeps by subject
-    subject_sweeps = {}
-    for s in sweeps:
-        subj = s["subject_id"]
-        if subj not in subject_sweeps:
-            subject_sweeps[subj] = []
-        subject_sweeps[subj].append(s)
-
-    folds = {}
-    for test_subj in sorted(subject_sweeps.keys()):
-        fold_name = f"LOSO_{test_subj}"
-        train_sweeps = []
-        test_sweeps = subject_sweeps[test_subj]
-
-        for subj, sws in subject_sweeps.items():
-            if subj != test_subj:
-                train_sweeps.extend(sws)
-
-        folds[fold_name] = {
-            "test_subject": test_subj,
-            "train_sweeps": train_sweeps,
-            "test_sweeps": test_sweeps,
-        }
-
-    return folds
-
-
-def generate_windows(sweeps, window_size=5, slide_step=2):
-    """Generate overlapping frame windows from a list of sweeps."""
-    windows = []
-    for sweep in sweeps:
-        frames = sweep["frame_paths"]
-        label = sweep["label"]
-        subject_id = sweep["subject_id"]
-        sweep_id = sweep["sweep_id"]
-
-        if len(frames) < window_size:
-            continue
-
-        n_windows = (len(frames) - window_size) // slide_step + 1
-        for i in range(n_windows):
-            start = i * slide_step
-            window_frames = frames[start:start + window_size]
-            sample_id = f"{subject_id}_{sweep_id}_Win{window_size}_{i:03d}"
-            windows.append({
-                "sample_id": sample_id,
-                "subject_id": subject_id,
-                "sweep_id": sweep_id,
-                "frame_paths": window_frames,
-                "label": label,
-            })
-    return windows
 
 
 # ─── Training ────────────────────────────────────────────────────────────────
@@ -409,102 +94,6 @@ def evaluate(model, dataloader, criterion, device, corn_mode=False):
             labels.extend(targets.cpu().numpy())
 
     return total_loss / len(dataloader), np.array(preds), np.array(labels), np.array(probs)
-
-
-# ─── Metrics ─────────────────────────────────────────────────────────────────
-
-def compute_metrics(all_labels, all_preds, all_probs, num_classes=5):
-    """Compute comprehensive evaluation metrics.
-
-    Returns:
-        dict with all metrics
-    """
-    metrics = {}
-
-    # Weighted F1-score
-    metrics["weighted_f1"] = f1_score(all_labels, all_preds, average="weighted")
-
-    # Macro F1-score
-    metrics["macro_f1"] = f1_score(all_labels, all_preds, average="macro")
-
-    # Per-class recall
-    per_class_recall = recall_score(all_labels, all_preds, average=None)
-    metrics["per_class_recall"] = per_class_recall.tolist()
-
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
-    metrics["confusion_matrix"] = cm.tolist()
-
-    # Cohen's Kappa
-    metrics["cohens_kappa"] = cohen_kappa_score(all_labels, all_preds)
-
-    # Multi-class AUROC
-    if num_classes == 2:
-        # Binary: use positive class probability directly
-        try:
-            metrics["auroc_weighted"] = roc_auc_score(all_labels, all_probs[:, 1])
-        except ValueError:
-            metrics["auroc_weighted"] = 0.0
-    else:
-        labels_bin = label_binarize(all_labels, classes=list(range(num_classes)))
-        try:
-            metrics["auroc_weighted"] = roc_auc_score(
-                labels_bin, all_probs, multi_class="ovr", average="weighted"
-            )
-        except ValueError:
-            metrics["auroc_weighted"] = 0.0
-
-    # Per-class AUROC
-    per_class_auc = []
-    if num_classes == 2:
-        # Binary: one AUC score for the positive class
-        try:
-            per_class_auc.append(roc_auc_score(1 - all_labels, all_probs[:, 0]))  # Class 0 AUC
-            per_class_auc.append(roc_auc_score(all_labels, all_probs[:, 1]))       # Class 1 AUC
-        except ValueError:
-            per_class_auc = [0.0, 0.0]
-    else:
-        labels_bin = label_binarize(all_labels, classes=list(range(num_classes)))
-        for i in range(num_classes):
-            try:
-                auc = roc_auc_score(labels_bin[:, i], all_probs[:, i])
-                per_class_auc.append(auc)
-            except ValueError:
-                per_class_auc.append(0.0)
-    metrics["per_class_auc"] = per_class_auc
-
-    return metrics
-
-
-def print_metrics(metrics, num_classes=5):
-    """Print metrics in a formatted way."""
-    print(f"\n{'='*60}")
-    print("Comprehensive Evaluation Metrics")
-    print(f"{'='*60}")
-
-    print(f"\n  Weighted F1-score:  {metrics['weighted_f1']:.4f}")
-    print(f"  Macro F1-score:     {metrics['macro_f1']:.4f}")
-    print(f"  Cohen's Kappa:      {metrics['cohens_kappa']:.4f}")
-    print(f"  AUROC (weighted):   {metrics['auroc_weighted']:.4f}")
-
-    print(f"\n  Per-class Recall:")
-    for i, r in enumerate(metrics["per_class_recall"]):
-        print(f"    Class {i}: {r:.4f}")
-
-    print(f"\n  Per-class AUC:")
-    for i, a in enumerate(metrics["per_class_auc"]):
-        print(f"    Class {i}: {a:.4f}")
-
-    cm = np.array(metrics["confusion_matrix"])
-    print(f"\n  Confusion Matrix (rows=true, cols=pred):")
-    # Print header
-    header = "        " + "  ".join(f"{i:>5}" for i in range(num_classes))
-    print(header)
-    for i in range(num_classes):
-        row = "  ".join(f"{cm[i, j]:>5}" for j in range(num_classes))
-        print(f"    {i}   {row}")
-
-    print(f"\n{'='*60}")
 
 
 # ─── Main Training Loop ─────────────────────────────────────────────────────
