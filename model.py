@@ -88,7 +88,7 @@ class ArcFaceR50FeatureExtractor(nn.Module):
             if not weights_path or not os.path.exists(weights_path):
                 raise FileNotFoundError(
                     f"ArcFace ONNX model not found at: {weights_path}\n"
-                    f"Run: python download_arcface.py"
+                    f"Run: python scripts/download_models.py arcface"
                 )
             self.backbone = convert(weights_path)
             print(f"  Loaded ArcFace R50 via onnx2torch: {weights_path}")
@@ -186,6 +186,7 @@ class PainRecognitionModel(nn.Module):
         dropout=0.5,
         corn_mode=False,
         use_attention_pooling=False,
+        single_frame=False,
     ):
         super().__init__()
 
@@ -198,25 +199,29 @@ class PainRecognitionModel(nn.Module):
         self.feature_extractor = builder(pretrained=pretrained, weights_path=weights_path)
         feature_dim = self.feature_extractor.feature_dim
 
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=lstm_hidden_dim,
-            num_layers=lstm_num_layers,
-            batch_first=True,
-            dropout=dropout if lstm_num_layers > 1 else 0.0,
-        )
+        # Single-frame mode: skip LSTM, classify each frame independently
+        self.single_frame = single_frame
+        if not single_frame:
+            self.lstm = nn.LSTM(
+                input_size=feature_dim,
+                hidden_size=lstm_hidden_dim,
+                num_layers=lstm_num_layers,
+                batch_first=True,
+                dropout=dropout if lstm_num_layers > 1 else 0.0,
+            )
 
-        # Temporal pooling: attention-weighted or simple mean
-        self.use_attention_pooling = use_attention_pooling
-        if use_attention_pooling:
-            self.attention_pool = TemporalAttentionPooling(lstm_hidden_dim)
+            # Temporal pooling: attention-weighted or simple mean
+            self.use_attention_pooling = use_attention_pooling
+            if use_attention_pooling:
+                self.attention_pool = TemporalAttentionPooling(lstm_hidden_dim)
 
         # Corn ordinal regression: output K-1 logits for K classes
         self.corn_mode = corn_mode
         output_dim = num_classes - 1 if corn_mode else num_classes
+        classifier_input = feature_dim if single_frame else lstm_hidden_dim
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden_dim, output_dim),
+            nn.Linear(classifier_input, output_dim),
         )
 
     def freeze_backbone(self):
@@ -236,9 +241,11 @@ class PainRecognitionModel(nn.Module):
             list of param groups for optimizer
         """
         backbone_params = list(self.feature_extractor.parameters())
-        classifier_params = list(self.lstm.parameters()) + list(self.classifier.parameters())
-        if self.use_attention_pooling:
-            classifier_params += list(self.attention_pool.parameters())
+        classifier_params = list(self.classifier.parameters())
+        if not self.single_frame:
+            classifier_params += list(self.lstm.parameters())
+            if self.use_attention_pooling:
+                classifier_params += list(self.attention_pool.parameters())
         return [
             {"params": backbone_params, "lr": backbone_lr, "is_backbone": True},
             {"params": classifier_params, "lr": classifier_lr, "is_backbone": False},
@@ -248,11 +255,17 @@ class PainRecognitionModel(nn.Module):
         """Forward pass.
 
         Args:
-            x: (B, T, C, H, W) image sequence tensor
+            x: single_frame → (B, C, H, W) image tensor
+               sequence    → (B, T, C, H, W) image sequence tensor
 
         Returns:
             logits: (B, num_classes)
         """
+        if self.single_frame:
+            # Single-frame: (B, C, H, W) → backbone → classifier
+            features = self.feature_extractor(x)  # (B, 512)
+            return self.classifier(features)
+
         B, T, C, H, W = x.shape
 
         # Reshape to (B*T, C, H, W) for ResNet

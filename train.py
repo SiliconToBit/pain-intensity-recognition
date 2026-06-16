@@ -25,6 +25,7 @@ import swanlab
 from model import PainRecognitionModel
 from utils.dataset import (
     FrameSequenceDataset,
+    SingleFrameDataset,
     get_train_transforms,
     get_test_transforms,
     undersample_windows,
@@ -32,7 +33,7 @@ from utils.dataset import (
 )
 from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, load_progress
 from utils.losses import build_loss, corn_logits_to_preds, corn_logits_to_probs
-from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows
+from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows, generate_single_frames
 from utils.metrics import compute_metrics, print_metrics
 
 # GPU optimization
@@ -132,23 +133,57 @@ def train_and_evaluate(config, resume=False):
     print(f"Using {num_folds} folds for LOSO cross-validation")
 
     # ── Initialize SwanLab ──
+    # Build descriptive experiment name: {backbone}_{task}_{loss}[_{variants}]
+    task_str = "binary" if config.binary_mode else "5class"
+    exp_name = f"{config.pretrained_source}_{task_str}_{config.loss_type}"
+    variants = []
+    if config.use_attention_pooling:
+        variants.append("attention")
+    if variants:
+        exp_name += "_" + "_".join(variants)
+
+    # Group: experiment family (same config, different fold counts)
+    group_name = exp_name
+
+    # Tags: multi-dimensional filtering
+    tags = [
+        config.pretrained_source,
+        task_str,
+        config.loss_type,
+    ]
+    if config.use_attention_pooling:
+        tags.append("attention")
+    if config.undersample:
+        tags.append("undersample")
+
     run = swanlab.init(
         project="pain-intensity-recognition",
-        experiment_name=f"ResNet18-LSTM_{config.loss_type}_{'binary' if config.binary_mode else '5class'}",
+        experiment_name=exp_name,
+        group=group_name,
+        tags=tags,
         config={
             "backbone": config.backbone,
             "pretrained_source": config.pretrained_source,
             "num_classes": config.num_classes,
             "sequence_length": config.sequence_length,
+            "slide_step": config.slide_step,
             "batch_size": config.batch_size,
             "phase1_epochs": config.phase1_epochs,
             "phase2_epochs": config.phase2_epochs,
+            "phase1_lr": config.phase1_lr,
+            "phase2_backbone_lr": config.phase2_backbone_lr,
+            "phase2_classifier_lr": config.phase2_classifier_lr,
+            "warmup_epochs": config.warmup_epochs,
             "loss_type": config.loss_type,
+            "focal_gamma": config.focal_gamma,
             "lstm_hidden_dim": config.lstm_hidden_dim,
+            "lstm_num_layers": config.lstm_num_layers,
             "dropout": config.dropout,
             "use_attention": config.use_attention_pooling,
             "binary_mode": config.binary_mode,
             "undersample": config.undersample,
+            "class_weight": config.class_weight,
+            "patience": config.patience,
             "num_folds": config.num_folds or len(fold_names),
         },
     )
@@ -157,6 +192,7 @@ def train_and_evaluate(config, resume=False):
     all_preds = []
     all_labels = []
     all_probs = []
+    global_step = 0  # global epoch counter for cross-fold aggregated metrics
 
     for fold_idx, fold_name in enumerate(fold_names):
         # Skip completed folds
@@ -175,25 +211,31 @@ def train_and_evaluate(config, resume=False):
         print(f"Test subject: {test_subject}")
         print(f"Train sweeps: {len(train_sweeps)}, Test sweeps: {len(test_sweeps)}")
 
-        # Generate frame windows
-        train_windows = generate_windows(train_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-        test_windows = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-        print(f"Train windows: {len(train_windows)}, Test windows: {len(test_windows)}")
+        # Generate samples: single-frame or sequence windows
+        if config.single_frame:
+            train_samples = generate_single_frames(train_sweeps)
+            test_samples = generate_single_frames(test_sweeps)
+            print(f"Train frames: {len(train_samples)}, Test frames: {len(test_samples)}")
+            train_items, test_items = train_samples, test_samples
+        else:
+            train_items = generate_windows(train_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+            print(f"Train windows: {len(train_items)}, Test windows: {len(test_items)}")
 
         # Print class distribution
-        train_dist = Counter(w["label"] for w in train_windows)
-        test_dist = Counter(w["label"] for w in test_windows)
+        train_dist = Counter(w["label"] for w in train_items)
+        test_dist = Counter(w["label"] for w in test_items)
         print(f"  Train class distribution: {dict(sorted(train_dist.items()))}")
         print(f"  Test  class distribution: {dict(sorted(test_dist.items()))}")
 
-        if len(train_windows) == 0 or len(test_windows) == 0:
-            print(f"Skipping {fold_name}: no windows generated")
+        if len(train_items) == 0 or len(test_items) == 0:
+            print(f"Skipping {fold_name}: no samples generated")
             continue
 
         # Compute class weights from ORIGINAL distribution (before any undersampling)
         if config.class_weight != "none":
             class_weights = compute_class_weights(
-                train_windows, num_classes=config.num_classes, mode=config.class_weight,
+                train_items, num_classes=config.num_classes, mode=config.class_weight,
             ).to(device)
             print(f"  Class weights ({config.class_weight}): {class_weights.tolist()}")
         else:
@@ -201,12 +243,16 @@ def train_and_evaluate(config, resume=False):
 
         # Undersample training data
         if config.undersample:
-            train_windows = undersample_windows(train_windows, num_classes=config.num_classes)
-            print(f"Undersampled train windows: {len(train_windows)}")
+            train_items = undersample_windows(train_items, num_classes=config.num_classes)
+            print(f"Undersampled train samples: {len(train_items)}")
 
         # Create datasets and loaders
-        train_dataset = FrameSequenceDataset(train_windows, transform=get_train_transforms())
-        test_dataset = FrameSequenceDataset(test_windows, transform=get_test_transforms())
+        if config.single_frame:
+            train_dataset = SingleFrameDataset(train_items, transform=get_train_transforms())
+            test_dataset = SingleFrameDataset(test_items, transform=get_test_transforms())
+        else:
+            train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
+            test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=True,
@@ -241,6 +287,7 @@ def train_and_evaluate(config, resume=False):
             dropout=config.dropout,
             corn_mode=corn_mode,
             use_attention_pooling=config.use_attention_pooling,
+            single_frame=config.single_frame,
         ).to(device)
 
         scaler = GradScaler()
@@ -293,13 +340,22 @@ def train_and_evaluate(config, resume=False):
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
 
-            # Log to SwanLab
-            swanlab.log({
-                f"fold_{fold_idx}/phase1/train_loss": train_loss,
-                f"fold_{fold_idx}/phase1/val_loss": val_loss,
-                f"fold_{fold_idx}/phase1/train_f1": train_f1,
-                f"fold_{fold_idx}/phase1/val_f1": val_f1,
-            }, step=epoch + 1)
+            # Log to SwanLab — aggregated (cross-fold) + fold-specific
+            global_step += 1
+            log_dict = {
+                # Aggregated training curves (comparable across experiments)
+                "train/loss": train_loss,
+                "train/f1": train_f1,
+                "val/loss": val_loss,
+                "val/f1": val_f1,
+                "train/phase": 1,
+                # Fold-specific detail (drill-down when needed)
+                f"fold/{fold_idx}/phase1/train_loss": train_loss,
+                f"fold/{fold_idx}/phase1/val_loss": val_loss,
+                f"fold/{fold_idx}/phase1/train_f1": train_f1,
+                f"fold/{fold_idx}/phase1/val_f1": val_f1,
+            }
+            swanlab.log(log_dict, step=global_step)
 
             # Save checkpoint
             save_checkpoint(
@@ -384,14 +440,24 @@ def train_and_evaluate(config, resume=False):
                   f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
                   f"Backbone LR: {current_backbone_lr:.2e}")
 
-            # Log to SwanLab
-            swanlab.log({
-                f"fold_{fold_idx}/phase2/train_loss": train_loss,
-                f"fold_{fold_idx}/phase2/val_loss": val_loss,
-                f"fold_{fold_idx}/phase2/train_f1": train_f1,
-                f"fold_{fold_idx}/phase2/val_f1": val_f1,
-                f"fold_{fold_idx}/phase2/backbone_lr": current_backbone_lr,
-            }, step=epoch + 1)
+            # Log to SwanLab — aggregated + fold-specific
+            global_step += 1
+            log_dict = {
+                # Aggregated training curves
+                "train/loss": train_loss,
+                "train/f1": train_f1,
+                "val/loss": val_loss,
+                "val/f1": val_f1,
+                "val/backbone_lr": current_backbone_lr,
+                "train/phase": 2,
+                # Fold-specific detail
+                f"fold/{fold_idx}/phase2/train_loss": train_loss,
+                f"fold/{fold_idx}/phase2/val_loss": val_loss,
+                f"fold/{fold_idx}/phase2/train_f1": train_f1,
+                f"fold/{fold_idx}/phase2/val_f1": val_f1,
+                f"fold/{fold_idx}/phase2/backbone_lr": current_backbone_lr,
+            }
+            swanlab.log(log_dict, step=global_step)
 
             # Save checkpoint
             save_checkpoint(
@@ -433,8 +499,8 @@ def train_and_evaluate(config, resume=False):
 
         # Log fold result to SwanLab
         swanlab.log({
-            f"fold_results/{fold_name}/weighted_f1": fold_f1,
-            f"fold_results/{fold_name}/test_subject": test_subject,
+            "fold/weighted_f1": fold_f1,
+            "fold/test_subject": test_subject,
         }, step=fold_idx + 1)
 
         # Save progress
@@ -458,12 +524,19 @@ def train_and_evaluate(config, resume=False):
     print(classification_report(all_labels, all_preds, digits=4))
 
     # ── Log final metrics to SwanLab ──
-    swanlab.log({
+    final_log = {
         "final/weighted_f1": metrics["weighted_f1"],
         "final/macro_f1": metrics["macro_f1"],
         "final/cohens_kappa": metrics["cohens_kappa"],
         "final/auroc_weighted": metrics["auroc_weighted"],
-    })
+    }
+    # Per-class recall as independent scalars (bar-chart friendly)
+    for i, r in enumerate(metrics["per_class_recall"]):
+        final_log[f"final/recall_class_{i}"] = r
+    # Per-class AUC as independent scalars
+    for i, a in enumerate(metrics["per_class_auc"]):
+        final_log[f"final/auc_class_{i}"] = a
+    swanlab.log(final_log)
 
     # Log confusion matrix as image
     try:
@@ -518,6 +591,27 @@ def train_and_evaluate(config, resume=False):
     np.save(os.path.join(config.output_dir, "probabilities.npy"), all_probs)
     np.save(os.path.join(config.output_dir, "confusion_matrix.npy"),
             np.array(metrics["confusion_matrix"]))
+
+    # ── SwanLab Text Summary ──
+    summary_lines = [
+        f"## {exp_name} — Results Summary",
+        "",
+        f"- **Backbone:** {config.pretrained_source} ({config.backbone})",
+        f"- **Task:** {task_str} ({config.num_classes} classes)",
+        f"- **Loss:** {config.loss_type}",
+        f"- **Folds:** {len(completed_folds)} / {num_folds}",
+        "",
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| Weighted F1 | {metrics['weighted_f1']:.4f} |",
+        f"| Macro F1 | {metrics['macro_f1']:.4f} |",
+        f"| Cohen's Kappa | {metrics['cohens_kappa']:.4f} |",
+        f"| AUROC (weighted) | {metrics['auroc_weighted']:.4f} |",
+        "",
+        f"**Per-class Recall:** {', '.join(f'{r:.3f}' for r in metrics['per_class_recall'])}",
+        f"**Per-class AUC:** {', '.join(f'{a:.3f}' for a in metrics['per_class_auc'])}",
+    ]
+    swanlab.log({"summary": swanlab.Text("\n".join(summary_lines))})
 
     # ── Finish SwanLab run ──
     swanlab.finish()

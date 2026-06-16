@@ -78,6 +78,35 @@ class FrameSequenceDataset(Dataset):
         return sequence, torch.tensor(label, dtype=torch.long)
 
 
+class SingleFrameDataset(Dataset):
+    """Dataset that loads individual frames (no temporal sequence).
+
+    Each sample is a single image with a pain label.
+    Used for the single-frame baseline (ResNet-18 only, no LSTM).
+    """
+
+    def __init__(self, samples, transform=None):
+        """
+        Args:
+            samples: list of dicts, each with keys:
+                - "frame_path": single image file path
+                - "label": int pain intensity label
+            transform: torchvision transform to apply
+        """
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        img = Image.open(sample["frame_path"]).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, torch.tensor(sample["label"], dtype=torch.long)
+
+
 def undersample_windows(windows, num_classes=5):
     """Undersample windows to balance classes.
 

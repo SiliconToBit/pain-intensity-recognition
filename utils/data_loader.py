@@ -174,3 +174,24 @@ def generate_windows(sweeps, window_size=5, slide_step=2):
                 "label": label,
             })
     return windows
+
+
+def generate_single_frames(sweeps):
+    """Flatten sweeps into individual frame samples (no temporal windowing).
+
+    Each frame becomes an independent sample with its sweep's label.
+    Used for single-frame baseline (ResNet-18 only, no LSTM).
+
+    Returns:
+        list of dicts: [{frame_path, label, subject_id, sweep_id}, ...]
+    """
+    samples = []
+    for sweep in sweeps:
+        for fp in sweep["frame_paths"]:
+            samples.append({
+                "frame_path": fp,
+                "label": sweep["label"],
+                "subject_id": sweep["subject_id"],
+                "sweep_id": sweep["sweep_id"],
+            })
+    return samples

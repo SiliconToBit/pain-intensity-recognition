@@ -78,6 +78,7 @@ class Config:
 
         # Task mode
         self.binary_mode = False
+        self.single_frame = False
 
         # Device
         self.device = "cuda"
