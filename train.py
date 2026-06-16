@@ -498,9 +498,10 @@ def train_and_evaluate(config, resume=False):
         print(f"\n  {fold_name} ({test_subject}) | Weighted F1: {fold_f1:.4f}")
 
         # Log fold result to SwanLab
+        subject_num = int(test_subject.replace("Sub", ""))  # "Sub01" → 1
         swanlab.log({
             "fold/weighted_f1": fold_f1,
-            "fold/test_subject": test_subject,
+            "fold/test_subject_id": subject_num,
         }, step=fold_idx + 1)
 
         # Save progress
