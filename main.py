@@ -19,6 +19,8 @@ def main():
                         help="Single-frame mode: no LSTM, classify each frame independently")
     parser.add_argument("--vggface2", action="store_true", help="Use VGGFace2 pretrained weights (facenet-pytorch)")
     parser.add_argument("--arcface", action="store_true", help="Use ArcFace pretrained weights (insightface R50)")
+    parser.add_argument("--affectnet", action="store_true",
+                        help="Use AffectNet pretrained weights (ResNet-50, facial expression)")
     parser.add_argument("--loss", type=str, default=None, choices=["ce", "corn", "focal"],
                         help="Loss function: ce (default), corn (ordinal regression), focal")
     parser.add_argument("--focal_gamma", type=float, default=None,
@@ -45,6 +47,8 @@ def main():
         config.pretrained_source = "vggface2"
     if args.arcface:
         config.pretrained_source = "arcface"
+    if args.affectnet:
+        config.pretrained_source = "affectnet"
 
     if args.num_folds is not None:
         config.num_folds = args.num_folds

@@ -123,12 +123,95 @@ class ArcFaceR50FeatureExtractor(nn.Module):
         return self.backbone(x)
 
 
+class AffectNetFeatureExtractor(nn.Module):
+    """AffectNet pretrained ResNet-50 via ElenaRyumina/face_emotion_recognition.
+
+    Loads a ResNet-50 state_dict trained on AffectNet (7-class facial expression
+    recognition, 1M+ images) with non-standard key names, maps them to
+    torchvision ResNet-50 format, and extracts the backbone (output: 2048-dim).
+
+    Weights source: https://huggingface.co/ElenaRyumina/face_emotion_recognition
+    File: FER_static_ResNet50_AffectNet.pt
+
+    Key mapping:
+        conv_layer_s2_same → conv1
+        batch_norm1 → bn1
+        batch_norm → bn
+        i_downsample → downsample
+        fc1 → fc.0  (custom 2-layer head, removed for feature extraction)
+        fc2 → fc.2
+    """
+
+    def __init__(self, pretrained=True, weights_path=None, **kwargs):
+        super().__init__()
+        from torchvision.models import resnet50
+
+        if not pretrained:
+            raise ValueError(
+                "AffectNet R50 requires pretrained weights (no random init available)."
+            )
+
+        if not weights_path or not os.path.exists(weights_path):
+            raise FileNotFoundError(
+                f"AffectNet R50 weights not found at: {weights_path}\n"
+                f"Run: python scripts/download_models.py affectnet"
+            )
+
+        raw_sd = torch.load(weights_path, map_location="cpu", weights_only=True)
+
+        # Build torchvision-compatible ResNet-50
+        resnet = resnet50(weights=None)
+
+        # Key mapping: original naming → torchvision naming
+        mapping = {
+            "conv_layer_s2_same": "conv1",
+            "batch_norm1": "bn1",       # must come before batch_norm→bn
+            "batch_norm": "bn",          # layerX.Y.batch_normZ → layerX.Y.bnZ
+            "i_downsample": "downsample",
+            "fc1.": "fc.0.",
+            "fc2.": "fc.2.",
+        }
+
+        # Rebuild the custom FC head so all keys can be loaded with strict=True
+        resnet.fc = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.ReLU(),
+            nn.Linear(512, 7),
+        )
+
+        clean_sd = {}
+        for k, v in raw_sd.items():
+            new_key = k
+            for old, new in mapping.items():
+                new_key = new_key.replace(old, new)
+            clean_sd[new_key] = v
+
+        resnet.load_state_dict(clean_sd, strict=True)
+
+        # Extract backbone (remove FC head)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.feature_dim = 2048
+
+        # Freeze — AffectNet weights used as frozen features
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        print(f"  Loaded AffectNet ResNet-50: {weights_path}")
+
+    def forward(self, x):
+        return self.backbone(x).flatten(1)  # (B, 2048)
+
+
 # ─── Backbone Registry ──────────────────────────────────────────────────────
 
 BACKBONE_BUILDERS = {
     "imagenet": lambda **kw: ResNet18FeatureExtractor(pretrained=kw.get("pretrained", True)),
     "vggface2": lambda **kw: FaceNetFeatureExtractor(pretrained=kw.get("pretrained", True)),
     "arcface": lambda **kw: ArcFaceR50FeatureExtractor(
+        pretrained=kw.get("pretrained", True),
+        weights_path=kw.get("weights_path"),
+    ),
+    "affectnet": lambda **kw: AffectNetFeatureExtractor(
         pretrained=kw.get("pretrained", True),
         weights_path=kw.get("weights_path"),
     ),

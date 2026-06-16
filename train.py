@@ -271,6 +271,8 @@ def train_and_evaluate(config, resume=False):
         weights_path = None
         if config.pretrained_source == "arcface":
             weights_path = os.path.join(config.pretrained_weights_path, "w600k_r50.onnx")
+        elif config.pretrained_source == "affectnet":
+            weights_path = os.path.join(config.pretrained_weights_path, "FER_static_ResNet50_AffectNet.pt")
 
         # Build loss function (supports CE, Corn ordinal, Focal)
         criterion, corn_mode = build_loss(config, class_weights)

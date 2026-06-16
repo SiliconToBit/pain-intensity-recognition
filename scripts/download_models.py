@@ -170,11 +170,45 @@ def download_vggface2():
         print(f"  and save to: {output_path}")
 
 
+# ─── AffectNet ResNet-50 ─────────────────────────────────────────────────────
+
+AFFECTNET_URL = "https://huggingface.co/ElenaRyumina/face_emotion_recognition/resolve/main/FER_static_ResNet50_AffectNet.pt"
+AFFECTNET_WEIGHTS_NAME = "FER_static_ResNet50_AffectNet.pt"
+
+
+def download_affectnet():
+    """Download AffectNet pretrained ResNet-50 from ElenaRyumina/face_emotion_recognition.
+
+    Source: https://huggingface.co/ElenaRyumina/face_emotion_recognition
+    Model: ResNet-50 trained on AffectNet (7-class facial expression recognition).
+    Format: PyTorch state_dict (non-standard key names, mapped at load time).
+    """
+    output_path = PRETRAINED_DIR / AFFECTNET_WEIGHTS_NAME
+    ensure_dir(PRETRAINED_DIR)
+
+    if not confirm_overwrite(output_path):
+        return
+
+    success = download_file(AFFECTNET_URL, output_path)
+
+    if success:
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        print(f"\nDone! AffectNet ResNet-50 weights ready: {output_path} ({size_mb:.1f} MB)")
+        print(f"\nTo use AffectNet pretrained weights, run:")
+        print(f"  python main.py --affectnet --binary --num_folds 1")
+        print(f"\nNote: Outputs 2048-dim features (ResNet-50)")
+    else:
+        print(f"\nFailed to download. Manual download:")
+        print(f"  {AFFECTNET_URL}")
+        print(f"  Save to: {output_path}")
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 DOWNLOADERS = {
     "arcface": download_arcface,
     "vggface2": download_vggface2,
+    "affectnet": download_affectnet,
 }
 
 
