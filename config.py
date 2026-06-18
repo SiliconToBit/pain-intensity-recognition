@@ -26,7 +26,8 @@ class Config:
     based on detected GPU VRAM and CPU core count at init time.
     """
 
-    def __init__(self, config_path=None, batch_size=None, num_workers=None):
+    def __init__(self, config_path=None, batch_size=None, num_workers=None,
+                 pretrained_source=None):
         project_root = os.path.dirname(os.path.abspath(__file__))
 
         # Dataset root: env var > default
@@ -48,7 +49,7 @@ class Config:
         self.sequence_length = 5
         self.slide_step = 2
         self.pretrained = True
-        self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface" | "affectnet"
+        self.pretrained_source = pretrained_source or "imagenet"  # "imagenet" | "vggface2" | "arcface" | "affectnet"
         self.pretrained_weights_path = os.path.join(project_root, "pretrained")
 
         # Pretrained weight filenames (override via YAML if needed)
@@ -119,12 +120,18 @@ class Config:
         """Auto-scale batch_size and num_workers to detected GPU VRAM."""
         vram_gb = detect_gpu_vram()
 
-        # Scale batch_size to VRAM (base: 96 for 10.5 GB, linear scaling)
+        # Scale batch_size to VRAM
+        # Heavier backbones (ResNet-50: arcface, affectnet) need more VRAM per sample
+        # so we use a smaller base batch size for them.
         if self.batch_size is None:
             if vram_gb > 0:
                 # Reserve ~2GB for CUDA context, scale remainder
                 usable_gb = max(0, vram_gb - 2)
-                self.batch_size = max(16, min(256, int(96 * usable_gb / 8.5)))
+                # ResNet-50 backbones need ~2.5x more memory than ResNet-18
+                if self.pretrained_source in ("arcface", "affectnet"):
+                    self.batch_size = max(8, min(128, int(32 * usable_gb / 8.5)))
+                else:
+                    self.batch_size = max(16, min(256, int(96 * usable_gb / 8.5)))
             else:
                 self.batch_size = 32  # safe CPU fallback
 

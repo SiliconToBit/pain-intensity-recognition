@@ -41,7 +41,8 @@ from utils.repro import set_seed, seed_worker
 
 # ─── Training ────────────────────────────────────────────────────────────────
 
-def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mode=False):
+def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mode=False,
+                max_grad_norm=1.0):
     """Train one epoch."""
     model.train()
     total_loss = 0
@@ -56,6 +57,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mo
             logits = model(sequences)
             loss = criterion(logits, targets)
         scaler.scale(loss).backward()
+        # Unscale before clipping so the threshold is in the original scale
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
 
@@ -258,15 +262,33 @@ def train_and_evaluate(config, resume=False):
         else:
             train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
             test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
+
+        # Auto-reduce batch size for heavy ResNet-50 backbones to avoid OOM.
+        # AffectNet/ArcFace ResNet-50 uses ~5x more VRAM per image than ResNet-18,
+        # and with sequence_length frames per sample the memory scales linearly.
+        phase1_batch_size = config.batch_size
+        if config.pretrained_source in ("arcface", "affectnet") and not config.single_frame:
+            # Heuristic: each ResNet-50 frame needs ~0.1GB; with T frames and
+            # CUDA context overhead, cap so total fits in (VRAM - 1.5GB).
+            import torch as _torch
+            if _torch.cuda.is_available():
+                vram_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                usable = vram_gb - 1.5
+                safe_batch = max(4, int(usable / (0.10 * config.sequence_length)))
+                if phase1_batch_size > safe_batch:
+                    print(f"  Reducing batch size for {config.pretrained_source}: "
+                          f"{phase1_batch_size} → {safe_batch} (sequence×backbone)")
+                    phase1_batch_size = safe_batch
+
         train_loader = DataLoader(
-            train_dataset, batch_size=config.batch_size, shuffle=True,
+            train_dataset, batch_size=phase1_batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=True,
             persistent_workers=True if config.num_workers > 0 else False,
             generator=torch.Generator().manual_seed(config.seed),
             worker_init_fn=seed_worker,
         )
         test_loader = DataLoader(
-            test_dataset, batch_size=config.batch_size, shuffle=False,
+            test_dataset, batch_size=phase1_batch_size, shuffle=False,
             num_workers=config.num_workers, pin_memory=True,
             persistent_workers=True if config.num_workers > 0 else False,
         )
@@ -401,10 +423,15 @@ def train_and_evaluate(config, resume=False):
               f"({100*total_trainable/total_params:.1f}%)")
         print(f"  Backbone LR: 0 → {config.phase2_backbone_lr:.2e} over {config.warmup_epochs} epochs")
 
-        # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen
-        if config.pretrained_source == "arcface" and config.batch_size > 32:
-            phase2_batch_size = max(16, config.batch_size // 3)
-            print(f"  Reducing batch size for ArcFace fine-tuning: {config.batch_size} → {phase2_batch_size}")
+        # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen.
+        # Unfreezing the backbone enables gradient computation through all layers,
+        # roughly tripling VRAM usage compared to frozen-backbone Phase 1.
+        phase2_batch_size = phase1_batch_size  # start from Phase 1's (possibly already reduced) size
+        if config.pretrained_source in ("arcface", "affectnet"):
+            phase2_batch_size = max(4, phase1_batch_size // 2)
+            if phase2_batch_size < phase1_batch_size:
+                print(f"  Reducing batch size for {config.pretrained_source} fine-tuning: "
+                      f"{phase1_batch_size} → {phase2_batch_size}")
             train_loader = DataLoader(
                 train_dataset, batch_size=phase2_batch_size, shuffle=True,
                 num_workers=config.num_workers, pin_memory=True,

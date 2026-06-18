@@ -47,6 +47,9 @@ def main():
         args.config,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        pretrained_source="affectnet" if args.affectnet else
+                          "arcface" if args.arcface else
+                          "vggface2" if args.vggface2 else None,
     )
 
     if args.vggface2:
