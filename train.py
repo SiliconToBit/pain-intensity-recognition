@@ -33,11 +33,10 @@ from utils.dataset import (
 )
 from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, load_progress
 from utils.losses import build_loss, corn_logits_to_preds, corn_logits_to_probs
+from utils.schedulers import WarmupReduceLROnPlateau
 from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows, generate_single_frames
 from utils.metrics import compute_metrics, print_metrics
-
-# GPU optimization
-torch.backends.cudnn.benchmark = True  # 加速固定输入尺寸的卷积
+from utils.repro import set_seed, seed_worker
 
 
 # ─── Training ────────────────────────────────────────────────────────────────
@@ -101,8 +100,11 @@ def evaluate(model, dataloader, criterion, device, corn_mode=False):
 
 def train_and_evaluate(config, resume=False):
     """Full LOSO cross-validation training and evaluation."""
+    # Seed every RNG up front so the whole LOSO run is reproducible.
+    set_seed(config.seed, deterministic=config.deterministic)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}  |  cudnn.benchmark: {torch.backends.cudnn.benchmark}")
+    print(f"Using device: {device}  |  seed: {config.seed}  |  "
+          f"deterministic: {config.deterministic}")
 
     # Scan dataset directory
     print("Scanning dataset...")
@@ -162,7 +164,6 @@ def train_and_evaluate(config, resume=False):
         group=group_name,
         tags=tags,
         config={
-            "backbone": config.backbone,
             "pretrained_source": config.pretrained_source,
             "num_classes": config.num_classes,
             "sequence_length": config.sequence_length,
@@ -185,6 +186,10 @@ def train_and_evaluate(config, resume=False):
             "class_weight": config.class_weight,
             "patience": config.patience,
             "num_folds": config.num_folds or len(fold_names),
+            "seed": config.seed,
+            "classifier_hidden_dim": config.classifier_hidden_dim,
+            "label_smoothing": config.label_smoothing,
+            "deterministic": config.deterministic,
         },
     )
 
@@ -257,6 +262,8 @@ def train_and_evaluate(config, resume=False):
             train_dataset, batch_size=config.batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=True,
             persistent_workers=True if config.num_workers > 0 else False,
+            generator=torch.Generator().manual_seed(config.seed),
+            worker_init_fn=seed_worker,
         )
         test_loader = DataLoader(
             test_dataset, batch_size=config.batch_size, shuffle=False,
@@ -270,9 +277,9 @@ def train_and_evaluate(config, resume=False):
         # so no external weights_path is needed.
         weights_path = None
         if config.pretrained_source == "arcface":
-            weights_path = os.path.join(config.pretrained_weights_path, "w600k_r50.onnx")
+            weights_path = os.path.join(config.pretrained_weights_path, config.arcface_weights_file)
         elif config.pretrained_source == "affectnet":
-            weights_path = os.path.join(config.pretrained_weights_path, "FER_static_ResNet50_AffectNet.pt")
+            weights_path = os.path.join(config.pretrained_weights_path, config.affectnet_weights_file)
 
         # Build loss function (supports CE, Corn ordinal, Focal)
         criterion, corn_mode = build_loss(config, class_weights)
@@ -290,6 +297,7 @@ def train_and_evaluate(config, resume=False):
             corn_mode=corn_mode,
             use_attention_pooling=config.use_attention_pooling,
             single_frame=config.single_frame,
+            classifier_hidden_dim=config.classifier_hidden_dim,
         ).to(device)
 
         scaler = GradScaler()
@@ -321,7 +329,8 @@ def train_and_evaluate(config, resume=False):
             lr=config.phase1_lr,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2,
+            optimizer, mode="min",
+            factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
         )
 
         phase1_start = max(0, start_epoch)
@@ -381,6 +390,17 @@ def train_and_evaluate(config, resume=False):
         print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
         model.unfreeze_backbone()
 
+        # Verify backbone is actually unfrozen
+        backbone_params = list(model.feature_extractor.parameters())
+        trainable = sum(p.requires_grad for p in backbone_params)
+        total = len(backbone_params)
+        total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Backbone: {trainable}/{total} params trainable")
+        print(f"  Model: {total_trainable/1e6:.1f}M / {total_params/1e6:.1f}M params trainable "
+              f"({100*total_trainable/total_params:.1f}%)")
+        print(f"  Backbone LR: 0 → {config.phase2_backbone_lr:.2e} over {config.warmup_epochs} epochs")
+
         # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen
         if config.pretrained_source == "arcface" and config.batch_size > 32:
             phase2_batch_size = max(16, config.batch_size // 3)
@@ -389,6 +409,8 @@ def train_and_evaluate(config, resume=False):
                 train_dataset, batch_size=phase2_batch_size, shuffle=True,
                 num_workers=config.num_workers, pin_memory=True,
                 persistent_workers=True if config.num_workers > 0 else False,
+                generator=torch.Generator().manual_seed(config.seed),
+                worker_init_fn=seed_worker,
             )
             test_loader = DataLoader(
                 test_dataset, batch_size=phase2_batch_size, shuffle=False,
@@ -397,12 +419,16 @@ def train_and_evaluate(config, resume=False):
             )
             torch.cuda.empty_cache()
         param_groups = model.get_param_groups(
-            backbone_lr=0.0,  # Start at 0, warmup will increase
+            backbone_lr=config.phase2_backbone_lr,  # target LR; scheduler starts at 0
             classifier_lr=config.phase2_classifier_lr,
         )
         optimizer = torch.optim.Adam(param_groups)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2,
+        scheduler = WarmupReduceLROnPlateau(
+            optimizer,
+            warmup_epochs=config.warmup_epochs,
+            warmup_group_indices=[0],  # group 0 = backbone
+            mode="min",
+            factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
         )
 
         # Reset early stopping state for Phase 2
@@ -412,26 +438,13 @@ def train_and_evaluate(config, resume=False):
         phase2_epochs = phase1_end + config.phase2_epochs
 
         for epoch in range(phase1_end, phase2_epochs):
-            # ── Warmup: linearly increase backbone LR ──
-            warmup_epoch = epoch - phase1_end
-            if warmup_epoch < config.warmup_epochs:
-                warmup_factor = (warmup_epoch + 1) / config.warmup_epochs
-                backbone_lr = config.phase2_backbone_lr * warmup_factor
-                # Update backbone LR in param groups
-                for pg in optimizer.param_groups:
-                    if pg.get("is_backbone", False):
-                        pg["lr"] = backbone_lr
-                if warmup_epoch == 0:
-                    print(f"  Warmup: backbone LR {0:.2e} → {config.phase2_backbone_lr:.2e} "
-                          f"over {config.warmup_epochs} epochs")
-
             train_loss, train_preds, train_labels = train_epoch(
                 model, train_loader, optimizer, criterion, device, scaler, corn_mode,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
                 model, test_loader, criterion, device, corn_mode,
             )
-            scheduler.step(val_loss)
+            scheduler.step(val_loss, epoch=epoch - phase1_end)
 
             # Print current backbone LR
             current_backbone_lr = optimizer.param_groups[0]["lr"]
@@ -499,12 +512,12 @@ def train_and_evaluate(config, resume=False):
         fold_f1 = f1_score(fold_labels, fold_preds, average="weighted")
         print(f"\n  {fold_name} ({test_subject}) | Weighted F1: {fold_f1:.4f}")
 
-        # Log fold result to SwanLab
+        # Log fold result to SwanLab (use global_step for consistency)
         subject_num = int(test_subject.replace("Sub", ""))  # "Sub01" → 1
         swanlab.log({
             "fold/weighted_f1": fold_f1,
             "fold/test_subject_id": subject_num,
-        }, step=fold_idx + 1)
+        }, step=global_step)
 
         # Per-fold echarts confusion matrix
         fold_class_names = (
@@ -516,7 +529,7 @@ def train_and_evaluate(config, resume=False):
                 f"fold/confusion_matrix_{test_subject}": swanlab.echarts.confusion_matrix(
                     fold_labels, fold_preds, fold_class_names
                 )
-            })
+            }, step=global_step)
         except Exception:
             pass  # pyecharts may not be installed
 

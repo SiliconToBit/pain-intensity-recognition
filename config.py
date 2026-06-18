@@ -37,15 +37,23 @@ class Config:
         self.preprocessed_dir = os.path.join(self.mintpain_root, "rgb_preprocessed")
         self.output_dir = os.path.join(self.mintpain_root, "results")
 
+        # Reproducibility
+        # True = fully reproducible (cudnn.deterministic, slightly slower);
+        # False = cudnn.benchmark acceleration (faster but non-deterministic).
+        self.seed = 42
+        self.deterministic = True
+
         # Model
         self.num_classes = 5
         self.sequence_length = 5
         self.slide_step = 2
-        self.backbone = "resnet18"
         self.pretrained = True
-        self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface"
+        self.pretrained_source = "imagenet"  # "imagenet" | "vggface2" | "arcface" | "affectnet"
         self.pretrained_weights_path = os.path.join(project_root, "pretrained")
-        self.backbone_frozen = True
+
+        # Pretrained weight filenames (override via YAML if needed)
+        self.arcface_weights_file = "w600k_r50.onnx"
+        self.affectnet_weights_file = "FER_static_ResNet50_AffectNet.pt"
 
         # Phase 1: train classifier only (backbone frozen)
         self.phase1_epochs = 10
@@ -57,6 +65,10 @@ class Config:
         self.phase2_classifier_lr = 5e-4
         self.warmup_epochs = 3
 
+        # Learning-rate scheduler (ReduceLROnPlateau, applied in both phases)
+        self.lr_scheduler_factor = 0.5
+        self.lr_scheduler_patience = 2
+
         # Training — auto-scaled by GPU VRAM, override via CLI or YAML
         self.batch_size = batch_size
         self.patience = 7
@@ -64,6 +76,7 @@ class Config:
         self.lstm_num_layers = 1
         self.dropout = 0.5
         self.use_attention_pooling = False
+        self.classifier_hidden_dim = 0   # 0=single Linear, >0=MLP hidden dim
 
         # Data & Class Imbalance
         self.num_workers = num_workers
@@ -71,10 +84,17 @@ class Config:
         self.class_weight = "none"  # 欠采样已平衡，不需要额外加权
         self.num_folds = 0
 
+        # Data augmentation (training transforms)
+        self.aug_scale = (0.8, 1.0)            # RandomResizedCrop scale range
+        self.aug_color_jitter = (0.2, 0.2, 0.2)  # (brightness, contrast, saturation)
+        self.aug_rotation_degrees = 5          # RandomAffine rotation ±degrees
+        self.aug_translate = 0.03              # RandomAffine translate fraction
+
         # Loss function
         self.loss_type = "ce"
         self.focal_gamma = 2.0
         self.focal_alpha = None
+        self.label_smoothing = 0.0       # 0=off, 0.1=moderate smoothing
 
         # Task mode
         self.binary_mode = False
@@ -91,6 +111,9 @@ class Config:
 
         # Auto-tune for detected GPU (only if not explicitly set)
         self._auto_tune()
+
+        # Validate mutual exclusivity of undersample and class_weight
+        self._validate_imbalance_strategy()
 
     def _auto_tune(self):
         """Auto-scale batch_size and num_workers to detected GPU VRAM."""
@@ -109,6 +132,19 @@ class Config:
         if self.num_workers is None:
             cpu_count = multiprocessing.cpu_count()
             self.num_workers = max(2, min(16, cpu_count // 2))
+
+    def _validate_imbalance_strategy(self):
+        """Ensure undersample and class_weight are not both active."""
+        if self.undersample and self.class_weight != "none":
+            import warnings
+            warnings.warn(
+                f"Both undersample=True and class_weight='{self.class_weight}' are set. "
+                f"These strategies are mutually exclusive — class_weight will be disabled. "
+                f"Use one: undersample balances data, class_weight re-weights the loss.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.class_weight = "none"
 
     def _load_config(self, config_path):
         import yaml
@@ -136,3 +172,7 @@ class Config:
         lines.append(f"Backbone: {self.pretrained_source}  |  Loss: {self.loss_type}")
         lines.append(f"Attention pooling: {self.use_attention_pooling}")
         return "\n".join(lines)
+
+    def to_dict(self):
+        """Serialize config to a plain dict (for checkpoint / logging)."""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}

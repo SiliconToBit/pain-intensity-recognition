@@ -192,9 +192,8 @@ class AffectNetFeatureExtractor(nn.Module):
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.feature_dim = 2048
 
-        # Freeze — AffectNet weights used as frozen features
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        # Note: freezing is handled at the model level via freeze_backbone()/unfreeze_backbone()
+        # to stay consistent with other backbone types.
 
         print(f"  Loaded AffectNet ResNet-50: {weights_path}")
 
@@ -270,6 +269,7 @@ class PainRecognitionModel(nn.Module):
         corn_mode=False,
         use_attention_pooling=False,
         single_frame=False,
+        classifier_hidden_dim=0,
     ):
         super().__init__()
 
@@ -300,12 +300,28 @@ class PainRecognitionModel(nn.Module):
 
         # Corn ordinal regression: output K-1 logits for K classes
         self.corn_mode = corn_mode
+        if corn_mode and num_classes < 2:
+            raise ValueError(
+                f"Corn mode requires num_classes >= 2, got {num_classes}. "
+                f"Corn ordinal regression needs at least 2 classes to produce K-1=1 output."
+            )
         output_dim = num_classes - 1 if corn_mode else num_classes
         classifier_input = feature_dim if single_frame else lstm_hidden_dim
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(classifier_input, output_dim),
-        )
+
+        if classifier_hidden_dim and classifier_hidden_dim > 0:
+            self.classifier = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(classifier_input, classifier_hidden_dim),
+                nn.BatchNorm1d(classifier_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout * 0.6),
+                nn.Linear(classifier_hidden_dim, output_dim),
+            )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(classifier_input, output_dim),
+            )
 
     def freeze_backbone(self):
         """Freeze ResNet-18 backbone parameters."""

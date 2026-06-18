@@ -9,21 +9,27 @@ from torchvision import transforms
 from PIL import Image
 
 
-def get_train_transforms():
+def get_train_transforms(
+    scale=(0.8, 1.0),
+    color_jitter=(0.2, 0.2, 0.2),
+    rotation_degrees=5,
+    translate=0.03,
+):
     """Training data augmentation.
 
     Pipeline:
         1. RandomResizedCrop: 随机裁剪后缩放，增加尺度变化
         2. RandomHorizontalFlip: 水平翻转
         3. ColorJitter: 亮度/对比度/饱和度随机变化，模拟光照变化
-        4. RandomAffine: 旋转±10° + 平移±5%
+        4. RandomAffine: 旋转±5° + 平移±3%
         5. ToTensor + ImageNet normalization
     """
+    brightness, contrast, saturation = color_jitter
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(224, scale=scale),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.RandomAffine(degrees=5, translate=(0.03, 0.03)),
+        transforms.ColorJitter(brightness=brightness, contrast=contrast, saturation=saturation),
+        transforms.RandomAffine(degrees=rotation_degrees, translate=(translate, translate)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -107,16 +113,22 @@ class SingleFrameDataset(Dataset):
         return img, torch.tensor(sample["label"], dtype=torch.long)
 
 
-def undersample_windows(windows, num_classes=5):
+def undersample_windows(windows, num_classes=5, seed=None):
     """Undersample windows to balance classes.
 
     Args:
         windows: list of window dicts with "label" key
         num_classes: number of classes
+        seed: optional RNG seed for the undersampling selection. When None,
+            the global NumPy RNG is used (set via utils.repro.set_seed for
+            reproducibility). Passing an explicit seed avoids mutating the
+            global RNG.
 
     Returns:
         balanced: list of undersampled window dicts
     """
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+
     label_to_windows = {i: [] for i in range(num_classes)}
     for w in windows:
         label_to_windows[w["label"]].append(w)
@@ -124,13 +136,12 @@ def undersample_windows(windows, num_classes=5):
     min_count = min(len(ws) for ws in label_to_windows.values())
 
     balanced = []
-    np.random.seed(42)
     for lbl in range(num_classes):
         ws = label_to_windows[lbl]
-        selected = np.random.choice(len(ws), size=min_count, replace=False)
+        selected = rng.choice(len(ws), size=min_count, replace=False)
         balanced.extend([ws[i] for i in selected])
 
-    np.random.shuffle(balanced)
+    rng.shuffle(balanced)
     return balanced
 
 

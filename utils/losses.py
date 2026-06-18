@@ -110,15 +110,17 @@ class FocalLoss(nn.Module):
     (e.g., adjacent pain level confusion).
     """
 
-    def __init__(self, alpha=None, gamma=2.0):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
         """
         Args:
             alpha: optional (num_classes,) class weights tensor
             gamma: focusing parameter (higher = more focus on hard examples)
+            label_smoothing: label smoothing factor (0 = no smoothing)
         """
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
         """
@@ -129,7 +131,10 @@ class FocalLoss(nn.Module):
         Returns:
             scalar loss
         """
-        ce_loss = F.cross_entropy(logits, targets, reduction="none", weight=self.alpha)
+        ce_loss = F.cross_entropy(
+            logits, targets, reduction="none", weight=self.alpha,
+            label_smoothing=self.label_smoothing,
+        )
         p_t = torch.exp(-ce_loss)  # predicted probability of true class
         focal_loss = (1 - p_t) ** self.gamma * ce_loss
         return focal_loss.mean()
@@ -145,10 +150,12 @@ def build_loss(config, class_weights=None):
     Returns:
         nn.Module loss function, and a bool `corn_mode` flag
     """
+    smoothing = getattr(config, "label_smoothing", 0.0)
+
     if config.loss_type == "corn":
         return CornLoss(config.num_classes, class_weights), True
     elif config.loss_type == "focal":
         alpha = class_weights if config.focal_alpha is None else config.focal_alpha
-        return FocalLoss(alpha=alpha, gamma=config.focal_gamma), False
+        return FocalLoss(alpha=alpha, gamma=config.focal_gamma, label_smoothing=smoothing), False
     else:  # "ce" or default
-        return nn.CrossEntropyLoss(weight=class_weights), False
+        return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=smoothing), False

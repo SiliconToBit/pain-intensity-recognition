@@ -27,6 +27,7 @@ def save_checkpoint(config, fold_idx, epoch, model, optimizer, scheduler,
         "scheduler_state_dict": scheduler.state_dict(),
         "best_val_loss": best_val_loss,
         "patience_counter": patience_counter,
+        "config": config.to_dict(),
     }
     torch.save(state, filepath)
 
@@ -51,8 +52,37 @@ def load_checkpoint(config, fold_idx, device="cpu"):
 
     print(f"  Loading checkpoint: {os.path.basename(latest_path)}")
     ckpt = torch.load(latest_path, map_location=device)
+
+    # Validate config compatibility
+    _validate_checkpoint_config(ckpt, config)
+
     start_epoch = ckpt["epoch"] + 1
     return ckpt, start_epoch
+
+
+def _validate_checkpoint_config(ckpt, config):
+    """Warn if checkpoint was saved with a different config."""
+    saved = ckpt.get("config")
+    if saved is None:
+        print("  ⚠️  Checkpoint has no config snapshot — skipping validation")
+        return
+
+    # Keys that affect model architecture (mismatches break state_dict loading)
+    arch_keys = [
+        "num_classes", "backbone", "pretrained_source", "lstm_hidden_dim",
+        "lstm_num_layers", "single_frame", "use_attention_pooling",
+        "classifier_hidden_dim",
+    ]
+    current = config.to_dict()
+    mismatches = []
+    for key in arch_keys:
+        if key in saved and key in current and saved[key] != current[key]:
+            mismatches.append(f"    {key}: checkpoint={saved[key]}, current={current[key]}")
+
+    if mismatches:
+        print("  ⚠️  Config mismatch (checkpoint may be incompatible):")
+        for line in mismatches:
+            print(line)
 
 
 def save_progress(config, stage, completed_folds):

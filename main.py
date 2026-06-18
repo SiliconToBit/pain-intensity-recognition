@@ -25,12 +25,18 @@ def main():
                         help="Loss function: ce (default), corn (ordinal regression), focal")
     parser.add_argument("--focal_gamma", type=float, default=None,
                         help="Focal loss gamma (higher = more focus on hard examples)")
+    parser.add_argument("--label_smoothing", type=float, default=None,
+                        help="Label smoothing factor (0=off, 0.1=moderate)")
+    parser.add_argument("--classifier_hidden", type=int, default=None,
+                        help="Classifier MLP hidden dim (0=single Linear, >0=MLP with BN)")
     parser.add_argument("--attention", action="store_true",
                         help="Use temporal attention pooling over LSTM outputs")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Batch size (auto-scaled to GPU VRAM if not set)")
     parser.add_argument("--num_workers", type=int, default=None,
                         help="DataLoader workers (auto-scaled to CPU cores if not set)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (default: 42)")
     args = parser.parse_args()
 
     # Set env var before creating Config
@@ -64,8 +70,15 @@ def main():
         config.loss_type = args.loss
     if args.focal_gamma is not None:
         config.focal_gamma = args.focal_gamma
+    if args.label_smoothing is not None:
+        config.label_smoothing = args.label_smoothing
+    if args.classifier_hidden is not None:
+        config.classifier_hidden_dim = args.classifier_hidden
     if args.attention:
         config.use_attention_pooling = True
+
+    if args.seed is not None:
+        config.seed = args.seed
 
     if args.resume:
         print("Resume mode enabled")
@@ -75,7 +88,7 @@ def main():
     pretrained_str = config.pretrained_source.upper() if config.pretrained else "None"
     print(f"Dataset: {config.preprocessed_dir}")
     print(f"Output:  {config.output_dir}")
-    print(f"Model:   {config.backbone} + {frame_str}  |  Pretrained: {pretrained_str}")
+    print(f"Model:   {pretrained_str} + {frame_str}  |  Seed: {config.seed}")
     print(f"Task:    {mode_str}  |  LOSO folds: {config.num_folds or 'all'}")
     print(config.gpu_summary())
 
