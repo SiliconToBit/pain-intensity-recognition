@@ -47,7 +47,8 @@ class Config:
         # Model
         self.num_classes = 5
         self.sequence_length = 5
-        self.slide_step = 2
+        self.num_windows_per_sweep = 3  # K: uniform windows per sweep (replaces slide_step)
+        self.slide_step = 2             # legacy: only used when num_windows_per_sweep=0
         self.pretrained = True
         self.pretrained_source = pretrained_source or "imagenet"  # "imagenet" | "vggface2" | "arcface" | "affectnet"
         self.pretrained_weights_path = os.path.join(project_root, "pretrained")
@@ -96,6 +97,8 @@ class Config:
         self.focal_gamma = 2.0
         self.focal_alpha = None
         self.label_smoothing = 0.0       # 0=off, 0.1=moderate smoothing
+        self.coral_consistency_weight = 0.05  # CORAL rank-consistency penalty λ
+        self.ordinal_lambda = 0.1            # WeightedOrdinalCE ordinal penalty λ
 
         # Task mode
         self.binary_mode = False
@@ -175,7 +178,7 @@ class Config:
         else:
             lines.append("GPU: none (CPU mode)")
         lines.append(f"Batch size: {self.batch_size}  |  Workers: {self.num_workers}")
-        lines.append(f"Sequence: {self.sequence_length} frames × {self.slide_step} stride")
+        lines.append(f"Sequence: {self.sequence_length} frames × {self.num_windows_per_sweep} windows/sweep")
         lines.append(f"Backbone: {self.pretrained_source}  |  Loss: {self.loss_type}")
         lines.append(f"Attention pooling: {self.use_attention_pooling}")
         return "\n".join(lines)

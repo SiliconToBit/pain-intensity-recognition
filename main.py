@@ -21,10 +21,14 @@ def main():
     parser.add_argument("--arcface", action="store_true", help="Use ArcFace pretrained weights (insightface R50)")
     parser.add_argument("--affectnet", action="store_true",
                         help="Use AffectNet pretrained weights (ResNet-50, facial expression)")
-    parser.add_argument("--loss", type=str, default=None, choices=["ce", "corn", "focal"],
-                        help="Loss function: ce (default), corn (ordinal regression), focal")
+    parser.add_argument("--loss", type=str, default=None, choices=["ce", "corn", "coral", "focal", "weighted_ordinal"],
+                        help="Loss function: ce (default), corn (ordinal), coral (rank-consistent ordinal), focal, weighted_ordinal (CE+ordinal penalty)")
     parser.add_argument("--focal_gamma", type=float, default=None,
                         help="Focal loss gamma (higher = more focus on hard examples)")
+    parser.add_argument("--coral_consistency_weight", type=float, default=None,
+                        help="CORAL rank-consistency penalty weight (default: 0.05)")
+    parser.add_argument("--ordinal_lambda", type=float, default=None,
+                        help="WeightedOrdinalCE ordinal distance penalty λ (default: 0.1)")
     parser.add_argument("--label_smoothing", type=float, default=None,
                         help="Label smoothing factor (0=off, 0.1=moderate)")
     parser.add_argument("--classifier_hidden", type=int, default=None,
@@ -73,6 +77,10 @@ def main():
         config.loss_type = args.loss
     if args.focal_gamma is not None:
         config.focal_gamma = args.focal_gamma
+    if args.coral_consistency_weight is not None:
+        config.coral_consistency_weight = args.coral_consistency_weight
+    if args.ordinal_lambda is not None:
+        config.ordinal_lambda = args.ordinal_lambda
     if args.label_smoothing is not None:
         config.label_smoothing = args.label_smoothing
     if args.classifier_hidden is not None:

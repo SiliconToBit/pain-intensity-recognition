@@ -149,30 +149,123 @@ def build_loso_folds(sweeps):
     return folds
 
 
-def generate_windows(sweeps, window_size=5, slide_step=2):
-    """Generate overlapping frame windows from a list of sweeps."""
+def split_train_val_by_subject(train_sweeps, val_ratio=0.15, seed=42):
+    """Split training sweeps into train/validation by subject.
+
+    Splits by subject (not by sweep) to avoid any temporal correlation
+    leakage between train and validation sets. The validation set is used
+    for early stopping and model selection; the LOSO test subject is used
+    only for final evaluation.
+
+    Args:
+        train_sweeps: list of sweep dicts from build_loso_folds
+        val_ratio: fraction of training subjects to reserve for validation
+        seed: RNG seed for reproducible subject selection
+
+    Returns:
+        (train_out, val_out): two lists of sweep dicts
+    """
+    rng = np.random.RandomState(seed)
+
+    # Group sweeps by subject
+    subject_sweeps = {}
+    for s in train_sweeps:
+        subj = s["subject_id"]
+        if subj not in subject_sweeps:
+            subject_sweeps[subj] = []
+        subject_sweeps[subj].append(s)
+
+    subjects = sorted(subject_sweeps.keys())
+    n_val = max(1, int(len(subjects) * val_ratio))
+
+    rng.shuffle(subjects)
+    val_subjects = set(subjects[:n_val])
+
+    train_out, val_out = [], []
+    for subj in subjects:
+        if subj in val_subjects:
+            val_out.extend(subject_sweeps[subj])
+        else:
+            train_out.extend(subject_sweeps[subj])
+
+    return train_out, val_out
+
+
+def generate_windows(sweeps, window_size=5, num_windows=None, slide_step=None):
+    """Generate frame windows from a list of sweeps.
+
+    Two modes:
+    1. num_windows=K: exactly K windows per sweep, uniformly spaced along the
+       timeline. Captures the full pain arc (onset → peak → decay) and gives
+       every sweep equal weight regardless of frame count.
+       Recommended K=3 for 7-frame minimum sweeps (window_size=5).
+
+       Pain timeline with K=4:
+       [无痛]...[痛觉建立]...[表情峰值]...[消退]
+       ├──w0──┤ ← onset
+           ├──w1──┤ ← building
+               ├──w2──┤ ← peak
+                   ├──w3──┤ ← decay
+
+    2. slide_step=S: legacy sliding-window mode (all overlapping windows with
+       stride S).  Only used when num_windows is None.
+
+    Args:
+        sweeps: list of sweep dicts
+        window_size: number of consecutive frames per window (default 5)
+        num_windows: exact number of uniformly-spaced windows per sweep (K)
+        slide_step: stride for legacy sliding-window mode
+
+    Returns:
+        list of window dicts
+    """
     windows = []
     for sweep in sweeps:
         frames = sweep["frame_paths"]
         label = sweep["label"]
         subject_id = sweep["subject_id"]
         sweep_id = sweep["sweep_id"]
+        n_frames = len(frames)
 
-        if len(frames) < window_size:
+        if n_frames < window_size:
             continue
 
-        n_windows = (len(frames) - window_size) // slide_step + 1
-        for i in range(n_windows):
-            start = i * slide_step
-            window_frames = frames[start:start + window_size]
-            sample_id = f"{subject_id}_{sweep_id}_Win{window_size}_{i:03d}"
-            windows.append({
-                "sample_id": sample_id,
-                "subject_id": subject_id,
-                "sweep_id": sweep_id,
-                "frame_paths": window_frames,
-                "label": label,
-            })
+        if num_windows and num_windows > 0:
+            # ── Uniform K-window sampling ──
+            k = min(num_windows, n_frames - window_size + 1)
+            span = n_frames - window_size  # valid start-index range
+            if k == 1:
+                starts = [span // 2]  # center window
+            else:
+                step = span / (k - 1)
+                starts = [round(i * step) for i in range(k)]
+            starts = sorted(set(starts))  # deduplicate (rare edge case)
+
+            for i, start in enumerate(starts):
+                window_frames = frames[start:start + window_size]
+                sample_id = f"{subject_id}_{sweep_id}_K{k}_W{window_size}_{i:02d}"
+                windows.append({
+                    "sample_id": sample_id,
+                    "subject_id": subject_id,
+                    "sweep_id": sweep_id,
+                    "frame_paths": window_frames,
+                    "label": label,
+                })
+        else:
+            # ── Legacy sliding-window mode ──
+            step = slide_step if slide_step else 2
+            n_windows = (n_frames - window_size) // step + 1
+            for i in range(n_windows):
+                start = i * step
+                window_frames = frames[start:start + window_size]
+                sample_id = f"{subject_id}_{sweep_id}_Win{window_size}_{i:03d}"
+                windows.append({
+                    "sample_id": sample_id,
+                    "subject_id": subject_id,
+                    "sweep_id": sweep_id,
+                    "frame_paths": window_frames,
+                    "label": label,
+                })
     return windows
 
 

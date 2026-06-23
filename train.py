@@ -34,14 +34,14 @@ from utils.dataset import (
 from utils.checkpoint import save_checkpoint, load_checkpoint, save_progress, load_progress
 from utils.losses import build_loss, corn_logits_to_preds, corn_logits_to_probs
 from utils.schedulers import WarmupReduceLROnPlateau
-from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows, generate_single_frames
+from utils.data_loader import scan_dataset, remap_to_binary, build_loso_folds, generate_windows, generate_single_frames, split_train_val_by_subject
 from utils.metrics import compute_metrics, print_metrics
 from utils.repro import set_seed, seed_worker
 
 
 # ─── Training ────────────────────────────────────────────────────────────────
 
-def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mode=False,
+def train_epoch(model, dataloader, optimizer, criterion, device, scaler, ordinal_mode=False,
                 max_grad_norm=1.0):
     """Train one epoch."""
     model.train()
@@ -64,7 +64,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mo
         scaler.update()
 
         total_loss += loss.item()
-        if corn_mode:
+        if ordinal_mode:
             preds.extend(corn_logits_to_preds(logits).cpu().numpy())
         else:
             preds.extend(logits.argmax(dim=1).cpu().numpy())
@@ -73,7 +73,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler, corn_mo
     return total_loss / len(dataloader), preds, labels
 
 
-def evaluate(model, dataloader, criterion, device, corn_mode=False):
+def evaluate(model, dataloader, criterion, device, ordinal_mode=False):
     """Evaluate model, return loss, predictions, labels, and probabilities."""
     model.eval()
     total_loss = 0
@@ -89,7 +89,7 @@ def evaluate(model, dataloader, criterion, device, corn_mode=False):
                 loss = criterion(logits, targets)
 
             total_loss += loss.item()
-            if corn_mode:
+            if ordinal_mode:
                 probs.extend(corn_logits_to_probs(logits).cpu().numpy())
                 preds.extend(corn_logits_to_preds(logits).cpu().numpy())
             else:
@@ -171,7 +171,7 @@ def train_and_evaluate(config, resume=False):
             "pretrained_source": config.pretrained_source,
             "num_classes": config.num_classes,
             "sequence_length": config.sequence_length,
-            "slide_step": config.slide_step,
+            "num_windows_per_sweep": config.num_windows_per_sweep,
             "batch_size": config.batch_size,
             "phase1_epochs": config.phase1_epochs,
             "phase2_epochs": config.phase2_epochs,
@@ -220,21 +220,35 @@ def train_and_evaluate(config, resume=False):
         print(f"Test subject: {test_subject}")
         print(f"Train sweeps: {len(train_sweeps)}, Test sweeps: {len(test_sweeps)}")
 
+        # Split training sweeps into train/validation by subject to avoid
+        # data leakage: validation set is used for early stopping & model
+        # selection; the LOSO test subject is used only for final evaluation.
+        train_sweeps_actual, val_sweeps = split_train_val_by_subject(
+            train_sweeps, val_ratio=0.15, seed=config.seed,
+        )
+        print(f"  Train subjects: {len(set(s['subject_id'] for s in train_sweeps_actual))}, "
+              f"Val subjects: {len(set(s['subject_id'] for s in val_sweeps))}")
+
         # Generate samples: single-frame or sequence windows
         if config.single_frame:
-            train_samples = generate_single_frames(train_sweeps)
-            test_samples = generate_single_frames(test_sweeps)
-            print(f"Train frames: {len(train_samples)}, Test frames: {len(test_samples)}")
-            train_items, test_items = train_samples, test_samples
+            train_items = generate_single_frames(train_sweeps_actual)
+            val_items = generate_single_frames(val_sweeps)
+            test_items = generate_single_frames(test_sweeps)
+            print(f"Train frames: {len(train_items)}, Val frames: {len(val_items)}, "
+                  f"Test frames: {len(test_items)}")
         else:
-            train_items = generate_windows(train_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-            print(f"Train windows: {len(train_items)}, Test windows: {len(test_items)}")
+            train_items = generate_windows(train_sweeps_actual, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
+            val_items = generate_windows(val_sweeps, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
+            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
+            print(f"Train windows: {len(train_items)}, Val windows: {len(val_items)}, "
+                  f"Test windows: {len(test_items)}")
 
         # Print class distribution
         train_dist = Counter(w["label"] for w in train_items)
+        val_dist = Counter(w["label"] for w in val_items)
         test_dist = Counter(w["label"] for w in test_items)
         print(f"  Train class distribution: {dict(sorted(train_dist.items()))}")
+        print(f"  Val   class distribution: {dict(sorted(val_dist.items()))}")
         print(f"  Test  class distribution: {dict(sorted(test_dist.items()))}")
 
         if len(train_items) == 0 or len(test_items) == 0:
@@ -258,9 +272,11 @@ def train_and_evaluate(config, resume=False):
         # Create datasets and loaders
         if config.single_frame:
             train_dataset = SingleFrameDataset(train_items, transform=get_train_transforms())
+            val_dataset = SingleFrameDataset(val_items, transform=get_test_transforms())
             test_dataset = SingleFrameDataset(test_items, transform=get_test_transforms())
         else:
             train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
+            val_dataset = FrameSequenceDataset(val_items, transform=get_test_transforms())
             test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
 
         # Auto-reduce batch size for heavy ResNet-50 backbones to avoid OOM.
@@ -287,6 +303,11 @@ def train_and_evaluate(config, resume=False):
             generator=torch.Generator().manual_seed(config.seed),
             worker_init_fn=seed_worker,
         )
+        val_loader = DataLoader(
+            val_dataset, batch_size=phase1_batch_size, shuffle=False,
+            num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
+        )
         test_loader = DataLoader(
             test_dataset, batch_size=phase1_batch_size, shuffle=False,
             num_workers=config.num_workers, pin_memory=True,
@@ -304,10 +325,10 @@ def train_and_evaluate(config, resume=False):
             weights_path = os.path.join(config.pretrained_weights_path, config.affectnet_weights_file)
 
         # Build loss function (supports CE, Corn ordinal, Focal)
-        criterion, corn_mode = build_loss(config, class_weights)
-        print(f"  Loss: {config.loss_type}" + (" (corn ordinal)" if corn_mode else ""))
+        criterion, ordinal_mode = build_loss(config, class_weights)
+        print(f"  Loss: {config.loss_type}" + (" (ordinal K-1 output)" if ordinal_mode else ""))
 
-        # Create model (Corn mode outputs K-1 logits for K-class ordinal regression)
+        # Create model (ordinal mode outputs K-1 logits for K-class ordinal regression)
         model = PainRecognitionModel(
             num_classes=config.num_classes,
             pretrained=config.pretrained,
@@ -316,7 +337,7 @@ def train_and_evaluate(config, resume=False):
             lstm_hidden_dim=config.lstm_hidden_dim,
             lstm_num_layers=config.lstm_num_layers,
             dropout=config.dropout,
-            corn_mode=corn_mode,
+            corn_mode=ordinal_mode,
             use_attention_pooling=config.use_attention_pooling,
             single_frame=config.single_frame,
             classifier_hidden_dim=config.classifier_hidden_dim,
@@ -324,7 +345,7 @@ def train_and_evaluate(config, resume=False):
 
         scaler = GradScaler()
 
-        best_val_loss = 0.0  # tracks val F1 (higher is better)
+        best_val_f1 = 0.0  # tracks val F1 (higher is better)
         best_model_state = None
         patience_counter = 0
         start_epoch = 0
@@ -335,9 +356,9 @@ def train_and_evaluate(config, resume=False):
             if ckpt is not None:
                 try:
                     model.load_state_dict(ckpt["model_state_dict"])
-                    best_val_loss = ckpt.get("best_val_loss", 0.0)
+                    best_val_f1 = ckpt.get("best_val_f1", ckpt.get("best_val_loss", 0.0))
                     patience_counter = ckpt.get("patience_counter", 0)
-                    print(f"  Resumed from epoch {start_epoch}, best_val_f1={best_val_loss:.4f}")
+                    print(f"  Resumed from epoch {start_epoch}, best_val_f1={best_val_f1:.4f}")
                 except (RuntimeError, KeyError) as e:
                     print(f"  Checkpoint incompatible (different architecture), starting fresh: {e}")
                     ckpt = None
@@ -351,7 +372,7 @@ def train_and_evaluate(config, resume=False):
             lr=config.phase1_lr,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min",
+            optimizer, mode="max",
             factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
         )
 
@@ -360,14 +381,14 @@ def train_and_evaluate(config, resume=False):
 
         for epoch in range(phase1_start, phase1_end):
             train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler, corn_mode,
+                model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, test_loader, criterion, device, corn_mode,
+                model, val_loader, criterion, device, ordinal_mode,
             )
-            scheduler.step(val_loss)
-
             val_f1 = f1_score(val_labels, val_preds, average="weighted")
+            scheduler.step(val_f1)
+
             train_f1 = f1_score(train_labels, train_preds, average="weighted")
             print(f"  Epoch {epoch+1}/{phase1_end} | "
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
@@ -393,11 +414,11 @@ def train_and_evaluate(config, resume=False):
             # Save checkpoint
             save_checkpoint(
                 config, fold_idx, epoch, model, optimizer, scheduler,
-                best_val_loss, patience_counter,
+                best_val_f1, patience_counter,
             )
 
-            if val_f1 > best_val_loss:  # track best val F1 (higher is better)
-                best_val_loss = val_f1
+            if val_f1 > best_val_f1:  # track best val F1 (higher is better)
+                best_val_f1 = val_f1
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -407,9 +428,17 @@ def train_and_evaluate(config, resume=False):
                     break
 
         # ── Phase 2: Unfreeze backbone, train with different LR + warmup ──
-        # Save Phase 1 best model as fallback
+        # Save Phase 1 best model and F1 as fallback
         phase1_best_state = best_model_state
+        phase1_best_f1 = best_val_f1
         print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
+
+        # Load Phase 1 best model as starting point for fine-tuning (not the
+        # last epoch, which may have overfit)
+        if phase1_best_state:
+            model.load_state_dict(phase1_best_state)
+            print(f"  Loaded Phase 1 best model (val_f1={phase1_best_f1:.4f}) as starting point")
+
         model.unfreeze_backbone()
 
         # Verify backbone is actually unfrozen
@@ -439,6 +468,11 @@ def train_and_evaluate(config, resume=False):
                 generator=torch.Generator().manual_seed(config.seed),
                 worker_init_fn=seed_worker,
             )
+            val_loader = DataLoader(
+                val_dataset, batch_size=phase2_batch_size, shuffle=False,
+                num_workers=config.num_workers, pin_memory=True,
+                persistent_workers=True if config.num_workers > 0 else False,
+            )
             test_loader = DataLoader(
                 test_dataset, batch_size=phase2_batch_size, shuffle=False,
                 num_workers=config.num_workers, pin_memory=True,
@@ -454,29 +488,29 @@ def train_and_evaluate(config, resume=False):
             optimizer,
             warmup_epochs=config.warmup_epochs,
             warmup_group_indices=[0],  # group 0 = backbone
-            mode="min",
+            mode="max",
             factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
         )
 
-        # Reset early stopping state for Phase 2
-        best_val_loss = 0.0  # reset val F1 tracking for phase 2
+        # Continue tracking from Phase 1 best — Phase 2 must improve over
+        # Phase 1 to update best_model_state. If it never does, Phase 1 best
+        # is used automatically (no reset).
         patience_counter = 0
-        best_model_state = None
         phase2_epochs = phase1_end + config.phase2_epochs
 
         for epoch in range(phase1_end, phase2_epochs):
             train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler, corn_mode,
+                model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, test_loader, criterion, device, corn_mode,
+                model, val_loader, criterion, device, ordinal_mode,
             )
-            scheduler.step(val_loss, epoch=epoch - phase1_end)
+            val_f1 = f1_score(val_labels, val_preds, average="weighted")
+            scheduler.step(val_f1, epoch=epoch - phase1_end)
 
             # Print current backbone LR
             current_backbone_lr = optimizer.param_groups[0]["lr"]
             train_f1 = f1_score(train_labels, train_preds, average="weighted")
-            val_f1 = f1_score(val_labels, val_preds, average="weighted")
             print(f"  Epoch {epoch+1}/{phase2_epochs} | "
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
@@ -504,11 +538,11 @@ def train_and_evaluate(config, resume=False):
             # Save checkpoint
             save_checkpoint(
                 config, fold_idx, epoch, model, optimizer, scheduler,
-                best_val_loss, patience_counter,
+                best_val_f1, patience_counter,
             )
 
-            if val_f1 > best_val_loss:  # track best val F1
-                best_val_loss = val_f1
+            if val_f1 > best_val_f1:  # track best val F1 (must beat Phase 1)
+                best_val_f1 = val_f1
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -517,17 +551,20 @@ def train_and_evaluate(config, resume=False):
                     print(f"  Early stopping at epoch {epoch+1}")
                     break
 
-        # Load best model: prefer Phase 2 best, fall back to Phase 1 best
+        # Load best model across both phases.
+        # best_model_state is Phase 2's best if it improved over Phase 1,
+        # otherwise it remains Phase 1's best (never reset).
         if best_model_state:
             model.load_state_dict(best_model_state)
-            print(f"  Using Phase 2 best model (val_f1={best_val_loss:.4f})")
-        elif phase1_best_state:
-            model.load_state_dict(phase1_best_state)
-            print(f"  Phase 2 did not improve, using Phase 1 best model")
+            if best_val_f1 > phase1_best_f1:
+                print(f"  Using Phase 2 best model (val_f1={best_val_f1:.4f})")
+            else:
+                print(f"  Phase 2 did not improve over Phase 1 "
+                      f"(val_f1={best_val_f1:.4f} ≤ {phase1_best_f1:.4f}), using Phase 1 best model")
         model.to(device)
 
         _, fold_preds, fold_labels, fold_probs = evaluate(
-            model, test_loader, criterion, device, corn_mode,
+            model, test_loader, criterion, device, ordinal_mode,
         )
 
         # Collect predictions

@@ -14,7 +14,7 @@ def get_checkpoint_dir(config):
 
 
 def save_checkpoint(config, fold_idx, epoch, model, optimizer, scheduler,
-                    best_val_loss, patience_counter):
+                    best_val_f1, patience_counter):
     """Save training checkpoint."""
     ckpt_dir = get_checkpoint_dir(config)
     filepath = os.path.join(ckpt_dir, f"fold{fold_idx:02d}_epoch{epoch:03d}.pth")
@@ -25,7 +25,7 @@ def save_checkpoint(config, fold_idx, epoch, model, optimizer, scheduler,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "best_val_loss": best_val_loss,
+        "best_val_f1": best_val_f1,
         "patience_counter": patience_counter,
         "config": config.to_dict(),
     }
