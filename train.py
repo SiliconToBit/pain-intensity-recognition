@@ -42,28 +42,35 @@ from utils.repro import set_seed, seed_worker
 # ─── Training ────────────────────────────────────────────────────────────────
 
 def train_epoch(model, dataloader, optimizer, criterion, device, scaler, ordinal_mode=False,
-                max_grad_norm=1.0):
-    """Train one epoch."""
+                max_grad_norm=1.0, grad_accum_steps=1):
+    """Train one epoch.
+
+    Args:
+        grad_accum_steps: accumulate gradients over N micro-batches before
+            stepping optimizer. Effective batch_size = batch_size * grad_accum_steps.
+    """
     model.train()
     total_loss = 0
     preds, labels = [], []
+    optimizer.zero_grad()
 
-    for sequences, targets in tqdm(dataloader, desc="Training", leave=False):
+    for step, (sequences, targets) in enumerate(tqdm(dataloader, desc="Training", leave=False)):
         sequences = sequences.to(device)
         targets = targets.to(device)
 
-        optimizer.zero_grad()
         with autocast():
             logits = model(sequences)
-            loss = criterion(logits, targets)
+            loss = criterion(logits, targets) / grad_accum_steps
         scaler.scale(loss).backward()
-        # Unscale before clipping so the threshold is in the original scale
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * grad_accum_steps  # un-scale for logging
         if ordinal_mode:
             preds.extend(corn_logits_to_preds(logits).cpu().numpy())
         else:
@@ -172,7 +179,9 @@ def train_and_evaluate(config, resume=False):
             "num_classes": config.num_classes,
             "sequence_length": config.sequence_length,
             "num_windows_per_sweep": config.num_windows_per_sweep,
-            "batch_size": config.batch_size,
+            "batch_size": phase1_batch_size,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "effective_batch_size": phase1_batch_size * config.gradient_accumulation_steps,
             "phase1_epochs": config.phase1_epochs,
             "phase2_epochs": config.phase2_epochs,
             "phase1_lr": config.phase1_lr,
@@ -282,18 +291,20 @@ def train_and_evaluate(config, resume=False):
         # Auto-reduce batch size for heavy ResNet-50 backbones to avoid OOM.
         # AffectNet/ArcFace ResNet-50 uses ~5x more VRAM per image than ResNet-18,
         # and with sequence_length frames per sample the memory scales linearly.
+        # Empirical measurements on RTX 2080 Ti (21.5 GB) with AffectNet+LSTM(T=5):
+        #   ~0.22 GB/sample  →  safe_max ≈ 90  (peak ~20 GB, 93% utilization)
         phase1_batch_size = config.batch_size
         if config.pretrained_source in ("arcface", "affectnet") and not config.single_frame:
-            # Heuristic: each ResNet-50 frame needs ~0.1GB; with T frames and
-            # CUDA context overhead, cap so total fits in (VRAM - 1.5GB).
             import torch as _torch
             if _torch.cuda.is_available():
                 vram_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                usable = vram_gb - 1.5
-                safe_batch = max(4, int(usable / (0.10 * config.sequence_length)))
+                usable = vram_gb - 1.0  # 1 GB safety margin for CUDA context
+                # Empirical: ~0.22 GB per sample (full T-frame sequence)
+                per_sample_gb = 0.22
+                safe_batch = max(4, int(usable / per_sample_gb))
                 if phase1_batch_size > safe_batch:
                     print(f"  Reducing batch size for {config.pretrained_source}: "
-                          f"{phase1_batch_size} → {safe_batch} (sequence×backbone)")
+                          f"{phase1_batch_size} → {safe_batch} (VRAM cap)")
                     phase1_batch_size = safe_batch
 
         train_loader = DataLoader(
@@ -382,6 +393,7 @@ def train_and_evaluate(config, resume=False):
         for epoch in range(phase1_start, phase1_end):
             train_loss, train_preds, train_labels = train_epoch(
                 model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
+                grad_accum_steps=config.gradient_accumulation_steps,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
                 model, val_loader, criterion, device, ordinal_mode,
@@ -501,6 +513,7 @@ def train_and_evaluate(config, resume=False):
         for epoch in range(phase1_end, phase2_epochs):
             train_loss, train_preds, train_labels = train_epoch(
                 model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
+                grad_accum_steps=config.gradient_accumulation_steps,
             )
             val_loss, val_preds, val_labels, val_probs = evaluate(
                 model, val_loader, criterion, device, ordinal_mode,

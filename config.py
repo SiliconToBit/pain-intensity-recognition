@@ -73,6 +73,7 @@ class Config:
 
         # Training — auto-scaled by GPU VRAM, override via CLI or YAML
         self.batch_size = batch_size
+        self.gradient_accumulation_steps = 1  # simulate larger batches (1=no accumulation)
         self.patience = 7
         self.lstm_hidden_dim = 256
         self.lstm_num_layers = 1
@@ -128,13 +129,16 @@ class Config:
         # so we use a smaller base batch size for them.
         if self.batch_size is None:
             if vram_gb > 0:
-                # Reserve ~2GB for CUDA context, scale remainder
-                usable_gb = max(0, vram_gb - 2)
-                # ResNet-50 backbones need ~2.5x more memory than ResNet-18
+                # Empirical per-sample VRAM usage (full forward+backward+optimizer):
+                #   ResNet-18 (imagenet/vggface2): ~0.06 GB/sample
+                #   ResNet-50 (arcface/affectnet): ~0.22 GB/sample
+                usable_gb = max(0, vram_gb - 1.0)  # 1 GB for CUDA context
                 if self.pretrained_source in ("arcface", "affectnet"):
-                    self.batch_size = max(8, min(128, int(32 * usable_gb / 8.5)))
+                    per_sample_gb = 0.22
+                    self.batch_size = max(8, min(128, int(usable_gb / per_sample_gb)))
                 else:
-                    self.batch_size = max(16, min(256, int(96 * usable_gb / 8.5)))
+                    per_sample_gb = 0.06
+                    self.batch_size = max(16, min(256, int(usable_gb / per_sample_gb)))
             else:
                 self.batch_size = 32  # safe CPU fallback
 
@@ -178,6 +182,9 @@ class Config:
         else:
             lines.append("GPU: none (CPU mode)")
         lines.append(f"Batch size: {self.batch_size}  |  Workers: {self.num_workers}")
+        if self.gradient_accumulation_steps > 1:
+            eff = self.batch_size * self.gradient_accumulation_steps
+            lines.append(f"Gradient accumulation: {self.gradient_accumulation_steps} steps  |  Effective batch: {eff}")
         lines.append(f"Sequence: {self.sequence_length} frames × {self.num_windows_per_sweep} windows/sweep")
         lines.append(f"Backbone: {self.pretrained_source}  |  Loss: {self.loss_type}")
         lines.append(f"Attention pooling: {self.use_attention_pooling}")

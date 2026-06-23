@@ -39,6 +39,8 @@ def main():
                         help="Batch size (auto-scaled to GPU VRAM if not set)")
     parser.add_argument("--num_workers", type=int, default=None,
                         help="DataLoader workers (auto-scaled to CPU cores if not set)")
+    parser.add_argument("--grad_accum", type=int, default=None,
+                        help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility (default: 42)")
     args = parser.parse_args()
@@ -87,6 +89,9 @@ def main():
         config.classifier_hidden_dim = args.classifier_hidden
     if args.attention:
         config.use_attention_pooling = True
+
+    if args.grad_accum is not None:
+        config.gradient_accumulation_steps = args.grad_accum
 
     if args.seed is not None:
         config.seed = args.seed
