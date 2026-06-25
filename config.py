@@ -131,10 +131,10 @@ class Config:
             if vram_gb > 0:
                 # Empirical per-sample VRAM usage (full forward+backward+optimizer):
                 #   ResNet-18 (imagenet/vggface2): ~0.06 GB/sample
-                #   ResNet-50 (arcface/affectnet): ~0.22 GB/sample
+                #   ResNet-50 (arcface/affectnet + LSTM): ~0.17 GB/sample
                 usable_gb = max(0, vram_gb - 1.0)  # 1 GB for CUDA context
                 if self.pretrained_source in ("arcface", "affectnet"):
-                    per_sample_gb = 0.22
+                    per_sample_gb = 0.17
                     self.batch_size = max(8, min(128, int(usable_gb / per_sample_gb)))
                 else:
                     per_sample_gb = 0.06
@@ -142,10 +142,10 @@ class Config:
             else:
                 self.batch_size = 32  # safe CPU fallback
 
-        # Scale num_workers to CPU cores (cap at 16, minimum 2)
+        # Scale num_workers to CPU cores (cap at all cores, minimum 2)
         if self.num_workers is None:
             cpu_count = multiprocessing.cpu_count()
-            self.num_workers = max(2, min(16, cpu_count // 2))
+            self.num_workers = max(2, cpu_count)
 
     def _validate_imbalance_strategy(self):
         """Ensure undersample and class_weight are not both active."""
@@ -185,7 +185,7 @@ class Config:
         if self.gradient_accumulation_steps > 1:
             eff = self.batch_size * self.gradient_accumulation_steps
             lines.append(f"Gradient accumulation: {self.gradient_accumulation_steps} steps  |  Effective batch: {eff}")
-        lines.append(f"Sequence: {self.sequence_length} frames × {self.num_windows_per_sweep} windows/sweep")
+        lines.append(f"Sequence: {self.sequence_length} frames × slide_step={self.slide_step}")
         lines.append(f"Backbone: {self.pretrained_source}  |  Loss: {self.loss_type}")
         lines.append(f"Attention pooling: {self.use_attention_pooling}")
         return "\n".join(lines)

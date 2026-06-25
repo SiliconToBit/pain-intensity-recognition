@@ -169,6 +169,33 @@ def train_and_evaluate(config, resume=False):
     if config.undersample:
         tags.append("undersample")
 
+    # Compute effective batch size based on actual VRAM & per-sample cost.
+    # Empirical measurements (RTX 2080 Ti 21.5 GB, AffectNet ResNet-50 + LSTM):
+    #   sequence mode (T=5): ~0.17 GB/sample  →  120 samples fit in 20.5 GB
+    #   single-frame mode:   ~0.04 GB/sample  →  ~450 samples
+    import torch as _torch
+    if _torch.cuda.is_available():
+        vram_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        usable = vram_gb - 1.0  # 1 GB safety margin for CUDA context
+        if config.pretrained_source in ("arcface", "affectnet"):
+            base_per_sample = 0.17   # AffectNet/ArcFace ResNet-50 + LSTM
+        else:
+            base_per_sample = 0.06   # lighter backbones (ResNet-18 etc.)
+        if config.single_frame:
+            per_sample_gb = base_per_sample / config.sequence_length
+            target_vram = usable * 0.90
+            phase1_batch_size = max(config.batch_size,
+                                    max(4, int(target_vram / per_sample_gb)))
+        else:
+            per_sample_gb = base_per_sample
+            target_vram = usable * 0.90
+            phase1_batch_size = min(config.batch_size,
+                                    max(4, int(target_vram / per_sample_gb)))
+        print(f"  Batch size: {phase1_batch_size} "
+              f"(VRAM {vram_gb:.1f} GB, per-sample {per_sample_gb:.3f} GB)")
+    else:
+        phase1_batch_size = config.batch_size
+
     run = swanlab.init(
         project="pain-intensity-recognition",
         experiment_name=exp_name,
@@ -246,9 +273,9 @@ def train_and_evaluate(config, resume=False):
             print(f"Train frames: {len(train_items)}, Val frames: {len(val_items)}, "
                   f"Test frames: {len(test_items)}")
         else:
-            train_items = generate_windows(train_sweeps_actual, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
-            val_items = generate_windows(val_sweeps, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
-            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, num_windows=config.num_windows_per_sweep)
+            train_items = generate_windows(train_sweeps_actual, window_size=config.sequence_length, slide_step=config.slide_step)
+            val_items = generate_windows(val_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
             print(f"Train windows: {len(train_items)}, Val windows: {len(val_items)}, "
                   f"Test windows: {len(test_items)}")
 
@@ -287,25 +314,6 @@ def train_and_evaluate(config, resume=False):
             train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
             val_dataset = FrameSequenceDataset(val_items, transform=get_test_transforms())
             test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
-
-        # Auto-reduce batch size for heavy ResNet-50 backbones to avoid OOM.
-        # AffectNet/ArcFace ResNet-50 uses ~5x more VRAM per image than ResNet-18,
-        # and with sequence_length frames per sample the memory scales linearly.
-        # Empirical measurements on RTX 2080 Ti (21.5 GB) with AffectNet+LSTM(T=5):
-        #   ~0.22 GB/sample  →  safe_max ≈ 90  (peak ~20 GB, 93% utilization)
-        phase1_batch_size = config.batch_size
-        if config.pretrained_source in ("arcface", "affectnet") and not config.single_frame:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                vram_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                usable = vram_gb - 1.0  # 1 GB safety margin for CUDA context
-                # Empirical: ~0.22 GB per sample (full T-frame sequence)
-                per_sample_gb = 0.22
-                safe_batch = max(4, int(usable / per_sample_gb))
-                if phase1_batch_size > safe_batch:
-                    print(f"  Reducing batch size for {config.pretrained_source}: "
-                          f"{phase1_batch_size} → {safe_batch} (VRAM cap)")
-                    phase1_batch_size = safe_batch
 
         train_loader = DataLoader(
             train_dataset, batch_size=phase1_batch_size, shuffle=True,
