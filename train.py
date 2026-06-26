@@ -2,7 +2,7 @@
 
 Pipeline:
     1. Load LOSO splits from scanned dataset
-    2. For each fold: generate frame windows → train model → collect predictions
+    2. For each fold: generate frame windows -> train model -> collect predictions
     3. After all folds: compute comprehensive metrics on aggregated predictions
 
 Supports two-phase training:
@@ -39,7 +39,7 @@ from utils.metrics import compute_metrics, print_metrics
 from utils.repro import set_seed, seed_worker
 
 
-# ─── Training ────────────────────────────────────────────────────────────────
+# --- Training helpers ---
 
 def train_epoch(model, dataloader, optimizer, criterion, device, scaler, ordinal_mode=False,
                 max_grad_norm=1.0, grad_accum_steps=1):
@@ -107,11 +107,15 @@ def evaluate(model, dataloader, criterion, device, ordinal_mode=False):
     return total_loss / len(dataloader), np.array(preds), np.array(labels), np.array(probs)
 
 
-# ─── Main Training Loop ─────────────────────────────────────────────────────
+# --- Experiment setup ---
 
-def train_and_evaluate(config, resume=False):
-    """Full LOSO cross-validation training and evaluation."""
-    # Seed every RNG up front so the whole LOSO run is reproducible.
+def _setup_experiment(config, resume=False):
+    """Initialize experiment: seed, dataset scan, LOSO folds, SwanLab.
+
+    Returns:
+        Tuple of (device, loso_folds, fold_names, num_folds, phase1_batch_size,
+                  exp_name, task_str, completed_folds).
+    """
     set_seed(config.seed, deterministic=config.deterministic)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}  |  seed: {config.seed}  |  "
@@ -122,7 +126,7 @@ def train_and_evaluate(config, resume=False):
     all_sweeps = scan_dataset(config)
     print(f"Found {len(all_sweeps)} sweeps across {len(set(s['subject_id'] for s in all_sweeps))} subjects")
 
-    # Binary mode: remap labels 0→0, 1-4→1
+    # Binary mode: remap labels 0->0, 1-4->1
     if config.binary_mode:
         all_sweeps = remap_to_binary(all_sweeps)
         print("Binary mode: remapped labels to 0 (no-pain) / 1 (pain)")
@@ -145,8 +149,7 @@ def train_and_evaluate(config, resume=False):
 
     print(f"Using {num_folds} folds for LOSO cross-validation")
 
-    # ── Initialize SwanLab ──
-    # Build descriptive experiment name: {backbone}_{task}_{loss}[_{variants}]
+    # -- Initialize SwanLab --
     task_str = "binary" if config.binary_mode else "5class"
     exp_name = f"{config.pretrained_source}_{task_str}_{config.loss_type}"
     variants = []
@@ -155,10 +158,7 @@ def train_and_evaluate(config, resume=False):
     if variants:
         exp_name += "_" + "_".join(variants)
 
-    # Group: experiment family (same config, different fold counts)
     group_name = exp_name
-
-    # Tags: multi-dimensional filtering
     tags = [
         config.pretrained_source,
         task_str,
@@ -170,17 +170,13 @@ def train_and_evaluate(config, resume=False):
         tags.append("undersample")
 
     # Compute effective batch size based on actual VRAM & per-sample cost.
-    # Empirical measurements (RTX 2080 Ti 21.5 GB, AffectNet ResNet-50 + LSTM):
-    #   sequence mode (T=5): ~0.17 GB/sample  →  120 samples fit in 20.5 GB
-    #   single-frame mode:   ~0.04 GB/sample  →  ~450 samples
-    import torch as _torch
-    if _torch.cuda.is_available():
-        vram_gb = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         usable = vram_gb - 1.0  # 1 GB safety margin for CUDA context
         if config.pretrained_source in ("arcface", "affectnet"):
-            base_per_sample = 0.17   # AffectNet/ArcFace ResNet-50 + LSTM
+            base_per_sample = 0.17
         else:
-            base_per_sample = 0.06   # lighter backbones (ResNet-18 etc.)
+            base_per_sample = 0.06
         if config.single_frame:
             per_sample_gb = base_per_sample / config.sequence_length
             target_vram = usable * 0.90
@@ -196,7 +192,7 @@ def train_and_evaluate(config, resume=False):
     else:
         phase1_batch_size = config.batch_size
 
-    run = swanlab.init(
+    swanlab.init(
         project="pain-intensity-recognition",
         experiment_name=exp_name,
         group=group_name,
@@ -233,88 +229,145 @@ def train_and_evaluate(config, resume=False):
         },
     )
 
-    # Collect all predictions across folds
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    global_step = 0  # global epoch counter for cross-fold aggregated metrics
+    return (device, loso_folds, fold_names, num_folds,
+            phase1_batch_size, exp_name, task_str, completed_folds)
 
-    for fold_idx, fold_name in enumerate(fold_names):
-        # Skip completed folds
-        if resume and fold_name in completed_folds:
-            print(f"\n⏭️  Skipping {fold_name} (already completed)")
-            continue
 
-        print(f"\n{'='*60}")
-        print(f"Fold: {fold_name} ({fold_idx + 1}/{num_folds})")
-        print(f"{'='*60}")
+# --- Phase training ---
 
-        fold_data = loso_folds[fold_name]
-        train_sweeps = fold_data["train_sweeps"]
-        test_sweeps = fold_data["test_sweeps"]
-        test_subject = fold_data["test_subject"]
-        print(f"Test subject: {test_subject}")
-        print(f"Train sweeps: {len(train_sweeps)}, Test sweeps: {len(test_sweeps)}")
+def train_phase1(model, train_loader, val_loader, criterion, device, scaler,
+                 config, fold_idx, global_step, start_epoch=0, ordinal_mode=False):
+    """Phase 1: Train classifier only (backbone frozen).
 
-        # Split training sweeps into train/validation by subject to avoid
-        # data leakage: validation set is used for early stopping & model
-        # selection; the LOSO test subject is used only for final evaluation.
-        train_sweeps_actual, val_sweeps = split_train_val_by_subject(
-            train_sweeps, val_ratio=0.15, seed=config.seed,
+    Returns:
+        Tuple of (best_model_state, best_val_f1, patience_counter, global_step).
+    """
+    print(f"\n  Phase 1: Training classifier (backbone frozen)")
+    model.freeze_backbone()
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.phase1_lr,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max",
+        factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
+    )
+
+    best_val_f1 = 0.0
+    best_model_state = None
+    patience_counter = 0
+    phase1_start = max(0, start_epoch)
+    phase1_end = config.phase1_epochs
+
+    for epoch in range(phase1_start, phase1_end):
+        train_loss, train_preds, train_labels = train_epoch(
+            model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
+            grad_accum_steps=config.gradient_accumulation_steps,
         )
-        print(f"  Train subjects: {len(set(s['subject_id'] for s in train_sweeps_actual))}, "
-              f"Val subjects: {len(set(s['subject_id'] for s in val_sweeps))}")
+        val_loss, val_preds, val_labels, val_probs = evaluate(
+            model, val_loader, criterion, device, ordinal_mode,
+        )
+        val_f1 = f1_score(val_labels, val_preds, average="weighted")
+        scheduler.step(val_f1)
 
-        # Generate samples: single-frame or sequence windows
-        if config.single_frame:
-            train_items = generate_single_frames(train_sweeps_actual)
-            val_items = generate_single_frames(val_sweeps)
-            test_items = generate_single_frames(test_sweeps)
-            print(f"Train frames: {len(train_items)}, Val frames: {len(val_items)}, "
-                  f"Test frames: {len(test_items)}")
+        train_f1 = f1_score(train_labels, train_preds, average="weighted")
+        print(f"  Epoch {epoch+1}/{phase1_end} | "
+              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
+
+        # Log to SwanLab
+        global_step += 1
+        log_dict = {
+            "train/loss": train_loss,
+            "train/f1": train_f1,
+            "val/loss": val_loss,
+            "val/f1": val_f1,
+            "train/phase": 1,
+            f"fold/{fold_idx}/phase1/train_loss": train_loss,
+            f"fold/{fold_idx}/phase1/val_loss": val_loss,
+            f"fold/{fold_idx}/phase1/train_f1": train_f1,
+            f"fold/{fold_idx}/phase1/val_f1": val_f1,
+        }
+        swanlab.log(log_dict, step=global_step)
+
+        save_checkpoint(
+            config, fold_idx, epoch, model, optimizer, scheduler,
+            best_val_f1, patience_counter,
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
         else:
-            train_items = generate_windows(train_sweeps_actual, window_size=config.sequence_length, slide_step=config.slide_step)
-            val_items = generate_windows(val_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-            test_items = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
-            print(f"Train windows: {len(train_items)}, Val windows: {len(val_items)}, "
-                  f"Test windows: {len(test_items)}")
+            patience_counter += 1
+            if patience_counter >= config.patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
 
-        # Print class distribution
-        train_dist = Counter(w["label"] for w in train_items)
-        val_dist = Counter(w["label"] for w in val_items)
-        test_dist = Counter(w["label"] for w in test_items)
-        print(f"  Train class distribution: {dict(sorted(train_dist.items()))}")
-        print(f"  Val   class distribution: {dict(sorted(val_dist.items()))}")
-        print(f"  Test  class distribution: {dict(sorted(test_dist.items()))}")
+    return best_model_state, best_val_f1, patience_counter, global_step
 
-        if len(train_items) == 0 or len(test_items) == 0:
-            print(f"Skipping {fold_name}: no samples generated")
-            continue
 
-        # Compute class weights from ORIGINAL distribution (before any undersampling)
-        if config.class_weight != "none":
-            class_weights = compute_class_weights(
-                train_items, num_classes=config.num_classes, mode=config.class_weight,
-            ).to(device)
-            print(f"  Class weights ({config.class_weight}): {class_weights.tolist()}")
-        else:
-            class_weights = None
+def train_phase2(model, train_dataset, val_dataset, test_dataset,
+                 criterion, device, scaler, config, fold_idx, global_step,
+                 phase1_end, phase1_batch_size, phase1_best_state, phase1_best_f1,
+                 ordinal_mode=False):
+    """Phase 2: Unfreeze backbone, train with different LR + warmup.
 
-        # Undersample training data
-        if config.undersample:
-            train_items = undersample_windows(train_items, num_classes=config.num_classes)
-            print(f"Undersampled train samples: {len(train_items)}")
+    Creates new dataloaders with potentially reduced batch size to avoid OOM
+    when backbone gradients are enabled.
 
-        # Create datasets and loaders
-        if config.single_frame:
-            train_dataset = SingleFrameDataset(train_items, transform=get_train_transforms())
-            val_dataset = SingleFrameDataset(val_items, transform=get_test_transforms())
-            test_dataset = SingleFrameDataset(test_items, transform=get_test_transforms())
-        else:
-            train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
-            val_dataset = FrameSequenceDataset(val_items, transform=get_test_transforms())
-            test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
+    Returns:
+        Tuple of (best_model_state, best_val_f1, train_loader, val_loader,
+                  test_loader, global_step).
+    """
+    print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
 
+    # Load Phase 1 best model as starting point
+    if phase1_best_state:
+        model.load_state_dict(phase1_best_state)
+        print(f"  Loaded Phase 1 best model (val_f1={phase1_best_f1:.4f}) as starting point")
+
+    model.unfreeze_backbone()
+
+    # Verify backbone is actually unfrozen
+    backbone_params = list(model.feature_extractor.parameters())
+    trainable = sum(p.requires_grad for p in backbone_params)
+    total = len(backbone_params)
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Backbone: {trainable}/{total} params trainable")
+    print(f"  Model: {total_trainable/1e6:.1f}M / {total_params/1e6:.1f}M params trainable "
+          f"({100*total_trainable/total_params:.1f}%)")
+    print(f"  Backbone LR: 0 -> {config.phase2_backbone_lr:.2e} over {config.warmup_epochs} epochs")
+
+    # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen
+    phase2_batch_size = phase1_batch_size
+    if config.pretrained_source in ("arcface", "affectnet"):
+        phase2_batch_size = max(4, phase1_batch_size // 2)
+        if phase2_batch_size < phase1_batch_size:
+            print(f"  Reducing batch size for {config.pretrained_source} fine-tuning: "
+                  f"{phase1_batch_size} -> {phase2_batch_size}")
+        train_loader = DataLoader(
+            train_dataset, batch_size=phase2_batch_size, shuffle=True,
+            num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
+            generator=torch.Generator().manual_seed(config.seed),
+            worker_init_fn=seed_worker,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=phase2_batch_size, shuffle=False,
+            num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=phase2_batch_size, shuffle=False,
+            num_workers=config.num_workers, pin_memory=True,
+            persistent_workers=True if config.num_workers > 0 else False,
+        )
+        torch.cuda.empty_cache()
+    else:
+        # Reuse Phase 1 loaders
         train_loader = DataLoader(
             train_dataset, batch_size=phase1_batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=True,
@@ -333,300 +386,272 @@ def train_and_evaluate(config, resume=False):
             persistent_workers=True if config.num_workers > 0 else False,
         )
 
-        # Create model
-        # Resolve weights path for external pretrained models.
-        # VGGFace2 loads weights internally via facenet-pytorch (InceptionResnetV1),
-        # so no external weights_path is needed.
-        weights_path = None
-        if config.pretrained_source == "arcface":
-            weights_path = os.path.join(config.pretrained_weights_path, config.arcface_weights_file)
-        elif config.pretrained_source == "affectnet":
-            weights_path = os.path.join(config.pretrained_weights_path, config.affectnet_weights_file)
+    param_groups = model.get_param_groups(
+        backbone_lr=config.phase2_backbone_lr,
+        classifier_lr=config.phase2_classifier_lr,
+    )
+    optimizer = torch.optim.Adam(param_groups)
+    scheduler = WarmupReduceLROnPlateau(
+        optimizer,
+        warmup_epochs=config.warmup_epochs,
+        warmup_group_indices=[0],  # group 0 = backbone
+        mode="max",
+        factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
+    )
 
-        # Build loss function (supports CE, Corn ordinal, Focal)
-        criterion, ordinal_mode = build_loss(config, class_weights)
-        print(f"  Loss: {config.loss_type}" + (" (ordinal K-1 output)" if ordinal_mode else ""))
+    # Continue tracking from Phase 1 best
+    best_val_f1 = phase1_best_f1
+    best_model_state = phase1_best_state
+    patience_counter = 0
+    phase2_epochs = phase1_end + config.phase2_epochs
 
-        # Create model (ordinal mode outputs K-1 logits for K-class ordinal regression)
-        model = PainRecognitionModel(
-            num_classes=config.num_classes,
-            pretrained=config.pretrained,
-            pretrained_source=config.pretrained_source,
-            weights_path=weights_path,
-            lstm_hidden_dim=config.lstm_hidden_dim,
-            lstm_num_layers=config.lstm_num_layers,
-            dropout=config.dropout,
-            corn_mode=ordinal_mode,
-            use_attention_pooling=config.use_attention_pooling,
-            single_frame=config.single_frame,
-            classifier_hidden_dim=config.classifier_hidden_dim,
+    for epoch in range(phase1_end, phase2_epochs):
+        train_loss, train_preds, train_labels = train_epoch(
+            model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
+            grad_accum_steps=config.gradient_accumulation_steps,
+        )
+        val_loss, val_preds, val_labels, val_probs = evaluate(
+            model, val_loader, criterion, device, ordinal_mode,
+        )
+        val_f1 = f1_score(val_labels, val_preds, average="weighted")
+        scheduler.step(val_f1, epoch=epoch - phase1_end)
+
+        current_backbone_lr = optimizer.param_groups[0]["lr"]
+        train_f1 = f1_score(train_labels, train_preds, average="weighted")
+        print(f"  Epoch {epoch+1}/{phase2_epochs} | "
+              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
+              f"Backbone LR: {current_backbone_lr:.2e}")
+
+        global_step += 1
+        log_dict = {
+            "train/loss": train_loss,
+            "train/f1": train_f1,
+            "val/loss": val_loss,
+            "val/f1": val_f1,
+            "val/backbone_lr": current_backbone_lr,
+            "train/phase": 2,
+            f"fold/{fold_idx}/phase2/train_loss": train_loss,
+            f"fold/{fold_idx}/phase2/val_loss": val_loss,
+            f"fold/{fold_idx}/phase2/train_f1": train_f1,
+            f"fold/{fold_idx}/phase2/val_f1": val_f1,
+            f"fold/{fold_idx}/phase2/backbone_lr": current_backbone_lr,
+        }
+        swanlab.log(log_dict, step=global_step)
+
+        save_checkpoint(
+            config, fold_idx, epoch, model, optimizer, scheduler,
+            best_val_f1, patience_counter,
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config.patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
+
+    return best_model_state, best_val_f1, train_loader, val_loader, test_loader, global_step
+
+
+# --- Fold execution ---
+
+def run_fold(config, fold_idx, fold_name, fold_data, device, phase1_batch_size,
+             global_step, resume=False):
+    """Execute one LOSO fold: prepare data, train both phases, evaluate.
+
+    Returns:
+        Tuple of (fold_preds, fold_labels, fold_probs, global_step) or
+        (None, None, None, global_step) if fold is skipped.
+    """
+    print(f"\n{'='*60}")
+    print(f"Fold: {fold_name} ({fold_idx + 1})")
+    print(f"{'='*60}")
+
+    train_sweeps = fold_data["train_sweeps"]
+    test_sweeps = fold_data["test_sweeps"]
+    test_subject = fold_data["test_subject"]
+    print(f"Test subject: {test_subject}")
+    print(f"Train sweeps: {len(train_sweeps)}, Test sweeps: {len(test_sweeps)}")
+
+    # Split training sweeps into train/validation by subject
+    train_sweeps_actual, val_sweeps = split_train_val_by_subject(
+        train_sweeps, val_ratio=0.15, seed=config.seed,
+    )
+    print(f"  Train subjects: {len(set(s['subject_id'] for s in train_sweeps_actual))}, "
+          f"Val subjects: {len(set(s['subject_id'] for s in val_sweeps))}")
+
+    # Generate samples: single-frame or sequence windows
+    if config.single_frame:
+        train_items = generate_single_frames(train_sweeps_actual)
+        val_items = generate_single_frames(val_sweeps)
+        test_items = generate_single_frames(test_sweeps)
+        print(f"Train frames: {len(train_items)}, Val frames: {len(val_items)}, "
+              f"Test frames: {len(test_items)}")
+    else:
+        train_items = generate_windows(train_sweeps_actual, window_size=config.sequence_length, slide_step=config.slide_step)
+        val_items = generate_windows(val_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+        test_items = generate_windows(test_sweeps, window_size=config.sequence_length, slide_step=config.slide_step)
+        print(f"Train windows: {len(train_items)}, Val windows: {len(val_items)}, "
+              f"Test windows: {len(test_items)}")
+
+    # Print class distribution
+    train_dist = Counter(w["label"] for w in train_items)
+    val_dist = Counter(w["label"] for w in val_items)
+    test_dist = Counter(w["label"] for w in test_items)
+    print(f"  Train class distribution: {dict(sorted(train_dist.items()))}")
+    print(f"  Val   class distribution: {dict(sorted(val_dist.items()))}")
+    print(f"  Test  class distribution: {dict(sorted(test_dist.items()))}")
+
+    if len(train_items) == 0 or len(test_items) == 0:
+        print(f"Skipping {fold_name}: no samples generated")
+        return None, None, None, global_step
+
+    # Compute class weights from ORIGINAL distribution (before any undersampling)
+    if config.class_weight != "none":
+        class_weights = compute_class_weights(
+            train_items, num_classes=config.num_classes, mode=config.class_weight,
         ).to(device)
+        print(f"  Class weights ({config.class_weight}): {class_weights.tolist()}")
+    else:
+        class_weights = None
 
-        scaler = GradScaler()
+    # Undersample training data
+    if config.undersample:
+        train_items = undersample_windows(train_items, num_classes=config.num_classes)
+        print(f"Undersampled train samples: {len(train_items)}")
 
-        best_val_f1 = 0.0  # tracks val F1 (higher is better)
-        best_model_state = None
-        patience_counter = 0
-        start_epoch = 0
+    # Create datasets and loaders
+    if config.single_frame:
+        train_dataset = SingleFrameDataset(train_items, transform=get_train_transforms())
+        val_dataset = SingleFrameDataset(val_items, transform=get_test_transforms())
+        test_dataset = SingleFrameDataset(test_items, transform=get_test_transforms())
+    else:
+        train_dataset = FrameSequenceDataset(train_items, transform=get_train_transforms())
+        val_dataset = FrameSequenceDataset(val_items, transform=get_test_transforms())
+        test_dataset = FrameSequenceDataset(test_items, transform=get_test_transforms())
 
-        # Load checkpoint if resuming
-        if resume:
-            ckpt, start_epoch = load_checkpoint(config, fold_idx, device)
-            if ckpt is not None:
-                try:
-                    model.load_state_dict(ckpt["model_state_dict"])
-                    best_val_f1 = ckpt.get("best_val_f1", ckpt.get("best_val_loss", 0.0))
-                    patience_counter = ckpt.get("patience_counter", 0)
-                    print(f"  Resumed from epoch {start_epoch}, best_val_f1={best_val_f1:.4f}")
-                except (RuntimeError, KeyError) as e:
-                    print(f"  Checkpoint incompatible (different architecture), starting fresh: {e}")
-                    ckpt = None
-                    start_epoch = 0
+    train_loader = DataLoader(
+        train_dataset, batch_size=phase1_batch_size, shuffle=True,
+        num_workers=config.num_workers, pin_memory=True,
+        persistent_workers=True if config.num_workers > 0 else False,
+        generator=torch.Generator().manual_seed(config.seed),
+        worker_init_fn=seed_worker,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=phase1_batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=True,
+        persistent_workers=True if config.num_workers > 0 else False,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=phase1_batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=True,
+        persistent_workers=True if config.num_workers > 0 else False,
+    )
 
-        # ── Phase 1: Train classifier only (backbone frozen) ──
-        print(f"\n  Phase 1: Training classifier (backbone frozen)")
-        model.freeze_backbone()
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=config.phase1_lr,
-        )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max",
-            factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
-        )
+    # Create model
+    weights_path = None
+    if config.pretrained_source == "arcface":
+        weights_path = os.path.join(config.pretrained_weights_path, config.arcface_weights_file)
+    elif config.pretrained_source == "affectnet":
+        weights_path = os.path.join(config.pretrained_weights_path, config.affectnet_weights_file)
 
-        phase1_start = max(0, start_epoch)
-        phase1_end = config.phase1_epochs
+    criterion, ordinal_mode = build_loss(config, class_weights)
+    print(f"  Loss: {config.loss_type}" + (" (ordinal K-1 output)" if ordinal_mode else ""))
 
-        for epoch in range(phase1_start, phase1_end):
-            train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
-                grad_accum_steps=config.gradient_accumulation_steps,
-            )
-            val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, val_loader, criterion, device, ordinal_mode,
-            )
-            val_f1 = f1_score(val_labels, val_preds, average="weighted")
-            scheduler.step(val_f1)
+    model = PainRecognitionModel(
+        num_classes=config.num_classes,
+        pretrained=config.pretrained,
+        pretrained_source=config.pretrained_source,
+        weights_path=weights_path,
+        lstm_hidden_dim=config.lstm_hidden_dim,
+        lstm_num_layers=config.lstm_num_layers,
+        dropout=config.dropout,
+        corn_mode=ordinal_mode,
+        use_attention_pooling=config.use_attention_pooling,
+        single_frame=config.single_frame,
+        classifier_hidden_dim=config.classifier_hidden_dim,
+    ).to(device)
 
-            train_f1 = f1_score(train_labels, train_preds, average="weighted")
-            print(f"  Epoch {epoch+1}/{phase1_end} | "
-                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
+    scaler = GradScaler()
 
-            # Log to SwanLab — aggregated (cross-fold) + fold-specific
-            global_step += 1
-            log_dict = {
-                # Aggregated training curves (comparable across experiments)
-                "train/loss": train_loss,
-                "train/f1": train_f1,
-                "val/loss": val_loss,
-                "val/f1": val_f1,
-                "train/phase": 1,
-                # Fold-specific detail (drill-down when needed)
-                f"fold/{fold_idx}/phase1/train_loss": train_loss,
-                f"fold/{fold_idx}/phase1/val_loss": val_loss,
-                f"fold/{fold_idx}/phase1/train_f1": train_f1,
-                f"fold/{fold_idx}/phase1/val_f1": val_f1,
-            }
-            swanlab.log(log_dict, step=global_step)
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if resume:
+        ckpt, start_epoch = load_checkpoint(config, fold_idx, device)
+        if ckpt is not None:
+            try:
+                model.load_state_dict(ckpt["model_state_dict"])
+                print(f"  Resumed from epoch {start_epoch}")
+            except (RuntimeError, KeyError) as e:
+                print(f"  Checkpoint incompatible (different architecture), starting fresh: {e}")
+                start_epoch = 0
 
-            # Save checkpoint
-            save_checkpoint(
-                config, fold_idx, epoch, model, optimizer, scheduler,
-                best_val_f1, patience_counter,
-            )
+    # -- Phase 1: Train classifier only (backbone frozen) --
+    phase1_best_state, phase1_best_f1, _, global_step = train_phase1(
+        model, train_loader, val_loader, criterion, device, scaler,
+        config, fold_idx, global_step, start_epoch=start_epoch, ordinal_mode=ordinal_mode,
+    )
 
-            if val_f1 > best_val_f1:  # track best val F1 (higher is better)
-                best_val_f1 = val_f1
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience:
-                    print(f"  Early stopping at epoch {epoch+1}")
-                    break
+    # -- Phase 2: Unfreeze backbone, train with different LR + warmup --
+    phase1_end = config.phase1_epochs
+    best_model_state, best_val_f1, train_loader, val_loader, test_loader, global_step = train_phase2(
+        model, train_dataset, val_dataset, test_dataset,
+        criterion, device, scaler, config, fold_idx, global_step,
+        phase1_end, phase1_batch_size, phase1_best_state, phase1_best_f1,
+        ordinal_mode=ordinal_mode,
+    )
 
-        # ── Phase 2: Unfreeze backbone, train with different LR + warmup ──
-        # Save Phase 1 best model and F1 as fallback
-        phase1_best_state = best_model_state
-        phase1_best_f1 = best_val_f1
-        print(f"\n  Phase 2: Fine-tuning (backbone unfrozen, warmup={config.warmup_epochs} epochs)")
+    # Load best model across both phases
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        if best_val_f1 > phase1_best_f1:
+            print(f"  Using Phase 2 best model (val_f1={best_val_f1:.4f})")
+        else:
+            print(f"  Phase 2 did not improve over Phase 1 "
+                  f"(val_f1={best_val_f1:.4f} <= {phase1_best_f1:.4f}), using Phase 1 best model")
+    model.to(device)
 
-        # Load Phase 1 best model as starting point for fine-tuning (not the
-        # last epoch, which may have overfit)
-        if phase1_best_state:
-            model.load_state_dict(phase1_best_state)
-            print(f"  Loaded Phase 1 best model (val_f1={phase1_best_f1:.4f}) as starting point")
+    # Evaluate on test set
+    _, fold_preds, fold_labels, fold_probs = evaluate(
+        model, test_loader, criterion, device, ordinal_mode,
+    )
 
-        model.unfreeze_backbone()
+    # Per-fold metrics
+    fold_f1 = f1_score(fold_labels, fold_preds, average="weighted")
+    print(f"\n  {fold_name} ({test_subject}) | Weighted F1: {fold_f1:.4f}")
 
-        # Verify backbone is actually unfrozen
-        backbone_params = list(model.feature_extractor.parameters())
-        trainable = sum(p.requires_grad for p in backbone_params)
-        total = len(backbone_params)
-        total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"  Backbone: {trainable}/{total} params trainable")
-        print(f"  Model: {total_trainable/1e6:.1f}M / {total_params/1e6:.1f}M params trainable "
-              f"({100*total_trainable/total_params:.1f}%)")
-        print(f"  Backbone LR: 0 → {config.phase2_backbone_lr:.2e} over {config.warmup_epochs} epochs")
+    subject_num = int(test_subject.replace("Sub", ""))
+    swanlab.log({
+        "fold/weighted_f1": fold_f1,
+        "fold/test_subject_id": subject_num,
+    }, step=global_step)
 
-        # Reduce batch size for Phase 2 to avoid OOM when backbone is unfrozen.
-        # Unfreezing the backbone enables gradient computation through all layers,
-        # roughly tripling VRAM usage compared to frozen-backbone Phase 1.
-        phase2_batch_size = phase1_batch_size  # start from Phase 1's (possibly already reduced) size
-        if config.pretrained_source in ("arcface", "affectnet"):
-            phase2_batch_size = max(4, phase1_batch_size // 2)
-            if phase2_batch_size < phase1_batch_size:
-                print(f"  Reducing batch size for {config.pretrained_source} fine-tuning: "
-                      f"{phase1_batch_size} → {phase2_batch_size}")
-            train_loader = DataLoader(
-                train_dataset, batch_size=phase2_batch_size, shuffle=True,
-                num_workers=config.num_workers, pin_memory=True,
-                persistent_workers=True if config.num_workers > 0 else False,
-                generator=torch.Generator().manual_seed(config.seed),
-                worker_init_fn=seed_worker,
-            )
-            val_loader = DataLoader(
-                val_dataset, batch_size=phase2_batch_size, shuffle=False,
-                num_workers=config.num_workers, pin_memory=True,
-                persistent_workers=True if config.num_workers > 0 else False,
-            )
-            test_loader = DataLoader(
-                test_dataset, batch_size=phase2_batch_size, shuffle=False,
-                num_workers=config.num_workers, pin_memory=True,
-                persistent_workers=True if config.num_workers > 0 else False,
-            )
-            torch.cuda.empty_cache()
-        param_groups = model.get_param_groups(
-            backbone_lr=config.phase2_backbone_lr,  # target LR; scheduler starts at 0
-            classifier_lr=config.phase2_classifier_lr,
-        )
-        optimizer = torch.optim.Adam(param_groups)
-        scheduler = WarmupReduceLROnPlateau(
-            optimizer,
-            warmup_epochs=config.warmup_epochs,
-            warmup_group_indices=[0],  # group 0 = backbone
-            mode="max",
-            factor=config.lr_scheduler_factor, patience=config.lr_scheduler_patience,
-        )
-
-        # Continue tracking from Phase 1 best — Phase 2 must improve over
-        # Phase 1 to update best_model_state. If it never does, Phase 1 best
-        # is used automatically (no reset).
-        patience_counter = 0
-        phase2_epochs = phase1_end + config.phase2_epochs
-
-        for epoch in range(phase1_end, phase2_epochs):
-            train_loss, train_preds, train_labels = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler, ordinal_mode,
-                grad_accum_steps=config.gradient_accumulation_steps,
-            )
-            val_loss, val_preds, val_labels, val_probs = evaluate(
-                model, val_loader, criterion, device, ordinal_mode,
-            )
-            val_f1 = f1_score(val_labels, val_preds, average="weighted")
-            scheduler.step(val_f1, epoch=epoch - phase1_end)
-
-            # Print current backbone LR
-            current_backbone_lr = optimizer.param_groups[0]["lr"]
-            train_f1 = f1_score(train_labels, train_preds, average="weighted")
-            print(f"  Epoch {epoch+1}/{phase2_epochs} | "
-                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
-                  f"Backbone LR: {current_backbone_lr:.2e}")
-
-            # Log to SwanLab — aggregated + fold-specific
-            global_step += 1
-            log_dict = {
-                # Aggregated training curves
-                "train/loss": train_loss,
-                "train/f1": train_f1,
-                "val/loss": val_loss,
-                "val/f1": val_f1,
-                "val/backbone_lr": current_backbone_lr,
-                "train/phase": 2,
-                # Fold-specific detail
-                f"fold/{fold_idx}/phase2/train_loss": train_loss,
-                f"fold/{fold_idx}/phase2/val_loss": val_loss,
-                f"fold/{fold_idx}/phase2/train_f1": train_f1,
-                f"fold/{fold_idx}/phase2/val_f1": val_f1,
-                f"fold/{fold_idx}/phase2/backbone_lr": current_backbone_lr,
-            }
-            swanlab.log(log_dict, step=global_step)
-
-            # Save checkpoint
-            save_checkpoint(
-                config, fold_idx, epoch, model, optimizer, scheduler,
-                best_val_f1, patience_counter,
-            )
-
-            if val_f1 > best_val_f1:  # track best val F1 (must beat Phase 1)
-                best_val_f1 = val_f1
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience:
-                    print(f"  Early stopping at epoch {epoch+1}")
-                    break
-
-        # Load best model across both phases.
-        # best_model_state is Phase 2's best if it improved over Phase 1,
-        # otherwise it remains Phase 1's best (never reset).
-        if best_model_state:
-            model.load_state_dict(best_model_state)
-            if best_val_f1 > phase1_best_f1:
-                print(f"  Using Phase 2 best model (val_f1={best_val_f1:.4f})")
-            else:
-                print(f"  Phase 2 did not improve over Phase 1 "
-                      f"(val_f1={best_val_f1:.4f} ≤ {phase1_best_f1:.4f}), using Phase 1 best model")
-        model.to(device)
-
-        _, fold_preds, fold_labels, fold_probs = evaluate(
-            model, test_loader, criterion, device, ordinal_mode,
-        )
-
-        # Collect predictions
-        all_preds.extend(fold_preds)
-        all_labels.extend(fold_labels)
-        all_probs.extend(fold_probs)
-
-        # Per-fold metrics
-        fold_f1 = f1_score(fold_labels, fold_preds, average="weighted")
-        print(f"\n  {fold_name} ({test_subject}) | Weighted F1: {fold_f1:.4f}")
-
-        # Log fold result to SwanLab (use global_step for consistency)
-        subject_num = int(test_subject.replace("Sub", ""))  # "Sub01" → 1
+    # Per-fold echarts confusion matrix
+    fold_class_names = (
+        ["无痛 (No Pain)", "疼痛 (Pain)"] if config.binary_mode
+        else ["无痛 (0)", "轻微疼痛 (1)", "中度疼痛 (2)", "较强疼痛 (3)", "剧烈疼痛 (4)"]
+    )
+    try:
         swanlab.log({
-            "fold/weighted_f1": fold_f1,
-            "fold/test_subject_id": subject_num,
+            f"fold/confusion_matrix_{test_subject}": swanlab.echarts.confusion_matrix(
+                fold_labels, fold_preds, fold_class_names
+            )
         }, step=global_step)
+    except Exception:
+        pass  # pyecharts may not be installed
 
-        # Per-fold echarts confusion matrix
-        fold_class_names = (
-            ["无痛 (No Pain)", "疼痛 (Pain)"] if config.binary_mode
-            else ["无痛 (0)", "轻微疼痛 (1)", "中度疼痛 (2)", "较强疼痛 (3)", "剧烈疼痛 (4)"]
-        )
-        try:
-            swanlab.log({
-                f"fold/confusion_matrix_{test_subject}": swanlab.echarts.confusion_matrix(
-                    fold_labels, fold_preds, fold_class_names
-                )
-            }, step=global_step)
-        except Exception:
-            pass  # pyecharts may not be installed
+    return fold_preds, fold_labels, fold_probs, global_step
 
-        # Save progress
-        completed_folds.append(fold_name)
-        save_progress(config, "train", completed_folds)
 
-    # ── Final Metrics ──
-    if len(all_preds) == 0:
-        print("No predictions collected. Check data paths.")
-        return
+# --- Final metrics ---
 
+def _log_final_metrics(config, all_preds, all_labels, all_probs, exp_name, task_str,
+                       completed_folds, num_folds):
+    """Compute and log final metrics after all folds."""
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
@@ -638,22 +663,20 @@ def train_and_evaluate(config, resume=False):
     print(f"\nClassification Report:")
     print(classification_report(all_labels, all_preds, digits=4))
 
-    # ── Log final metrics to SwanLab ──
+    # Log final metrics to SwanLab
     final_log = {
         "final/weighted_f1": metrics["weighted_f1"],
         "final/macro_f1": metrics["macro_f1"],
         "final/cohens_kappa": metrics["cohens_kappa"],
         "final/auroc_weighted": metrics["auroc_weighted"],
     }
-    # Per-class recall as independent scalars (bar-chart friendly)
     for i, r in enumerate(metrics["per_class_recall"]):
         final_log[f"final/recall_class_{i}"] = r
-    # Per-class AUC as independent scalars
     for i, a in enumerate(metrics["per_class_auc"]):
         final_log[f"final/auc_class_{i}"] = a
     swanlab.log(final_log)
 
-    # ── SwanLab ECharts: Confusion Matrix ──
+    # SwanLab ECharts: Confusion Matrix
     if config.binary_mode:
         class_names = ["无痛 (No Pain)", "疼痛 (Pain)"]
     else:
@@ -669,7 +692,7 @@ def train_and_evaluate(config, resume=False):
     except Exception as e:
         print(f"  Skipping echarts confusion matrix: {e}")
 
-    # ── SwanLab ECharts: ROC & PR Curves (binary mode) ──
+    # SwanLab ECharts: ROC & PR Curves (binary mode)
     if config.binary_mode:
         try:
             y_prob_pos = all_probs[:, 1]
@@ -738,9 +761,9 @@ def train_and_evaluate(config, resume=False):
     np.save(os.path.join(config.output_dir, "confusion_matrix.npy"),
             np.array(metrics["confusion_matrix"]))
 
-    # ── SwanLab Text Summary ──
+    # SwanLab Text Summary
     summary_lines = [
-        f"## {exp_name} — Results Summary",
+        f"## {exp_name} -- Results Summary",
         "",
         f"- **Backbone:** {config.pretrained_source} ({config.backbone})",
         f"- **Task:** {task_str} ({config.num_classes} classes)",
@@ -759,5 +782,50 @@ def train_and_evaluate(config, resume=False):
     ]
     swanlab.log({"summary": swanlab.Text("\n".join(summary_lines))})
 
-    # ── Finish SwanLab run ──
+
+# --- Main entry point ---
+
+def train_and_evaluate(config, resume=False):
+    """Full LOSO cross-validation training and evaluation."""
+    # Setup
+    (device, loso_folds, fold_names, num_folds,
+     phase1_batch_size, exp_name, task_str, completed_folds) = _setup_experiment(config, resume)
+
+    # Collect all predictions across folds
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    global_step = 0
+
+    for fold_idx, fold_name in enumerate(fold_names):
+        # Skip completed folds
+        if resume and fold_name in completed_folds:
+            print(f"\n  Skipping {fold_name} (already completed)")
+            continue
+
+        fold_data = loso_folds[fold_name]
+        fold_preds, fold_labels, fold_probs, global_step = run_fold(
+            config, fold_idx, fold_name, fold_data, device, phase1_batch_size,
+            global_step, resume=resume,
+        )
+
+        if fold_preds is None:
+            continue
+
+        all_preds.extend(fold_preds)
+        all_labels.extend(fold_labels)
+        all_probs.extend(fold_probs)
+
+        # Save progress
+        completed_folds.append(fold_name)
+        save_progress(config, "train", completed_folds)
+
+    # Final metrics
+    if len(all_preds) == 0:
+        print("No predictions collected. Check data paths.")
+        return
+
+    _log_final_metrics(config, all_preds, all_labels, all_probs, exp_name, task_str,
+                       completed_folds, num_folds)
+
     swanlab.finish()

@@ -56,6 +56,7 @@ def main():
         pretrained_source="affectnet" if args.affectnet else
                           "arcface" if args.arcface else
                           "vggface2" if args.vggface2 else None,
+        single_frame=args.single_frame,
     )
 
     if args.vggface2:

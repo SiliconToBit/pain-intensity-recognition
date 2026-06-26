@@ -27,7 +27,7 @@ class Config:
     """
 
     def __init__(self, config_path=None, batch_size=None, num_workers=None,
-                 pretrained_source=None):
+                 pretrained_source=None, single_frame=False):
         project_root = os.path.dirname(os.path.abspath(__file__))
 
         # Dataset root: env var > default
@@ -103,7 +103,7 @@ class Config:
 
         # Task mode
         self.binary_mode = False
-        self.single_frame = False
+        self.single_frame = single_frame
 
         # Device
         self.device = "cuda"
@@ -127,17 +127,22 @@ class Config:
         # Scale batch_size to VRAM
         # Heavier backbones (ResNet-50: arcface, affectnet) need more VRAM per sample
         # so we use a smaller base batch size for them.
+        # Single-frame mode uses less VRAM per sample (1 image, no LSTM).
         if self.batch_size is None:
             if vram_gb > 0:
                 # Empirical per-sample VRAM usage (full forward+backward+optimizer):
-                #   ResNet-18 (imagenet/vggface2): ~0.06 GB/sample
-                #   ResNet-50 (arcface/affectnet + LSTM): ~0.17 GB/sample
+                #   LSTM mode:
+                #     ResNet-18 (imagenet/vggface2): ~0.06 GB/sample
+                #     ResNet-50 (arcface/affectnet + LSTM): ~0.17 GB/sample
+                #   Single-frame mode (no LSTM, 1 image per sample):
+                #     ResNet-18: ~0.015 GB/sample
+                #     ResNet-50 (arcface/affectnet): ~0.04 GB/sample
                 usable_gb = max(0, vram_gb - 1.0)  # 1 GB for CUDA context
                 if self.pretrained_source in ("arcface", "affectnet"):
-                    per_sample_gb = 0.17
+                    per_sample_gb = 0.04 if self.single_frame else 0.17
                     self.batch_size = max(8, min(128, int(usable_gb / per_sample_gb)))
                 else:
-                    per_sample_gb = 0.06
+                    per_sample_gb = 0.015 if self.single_frame else 0.06
                     self.batch_size = max(16, min(256, int(usable_gb / per_sample_gb)))
             else:
                 self.batch_size = 32  # safe CPU fallback
